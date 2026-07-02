@@ -94,7 +94,9 @@ APP_USER_AGENT = get_secret_or_env(
 )
 GEOCODE_DELAY_SECONDS = float_setting("GEOCODE_DELAY_SECONDS", 1.05)
 MAX_OSRM_LOCATIONS = int_setting("MAX_OSRM_LOCATIONS", 80)
-APP_STATE_VERSION = "2026-07-02-v7-morning-and-afternoon-wait"
+APP_STATE_VERSION = "2026-07-02-v8-compact-same-car-clustering"
+WAIT_BUCKET_SECONDS = int_setting("WAIT_BUCKET_SECONDS", 600)
+COMPACT_PAIR_THRESHOLD_SECONDS = int_setting("COMPACT_PAIR_THRESHOLD_SECONDS", 45 * 60)
 
 
 def reset_stale_session_state() -> None:
@@ -490,6 +492,56 @@ def route_drive_distance(order: List[int], distance_matrix: List[List[int]]) -> 
     return sum(distance_matrix[order[i]][order[i + 1]] for i in range(len(order) - 1))
 
 
+def objective_bucket(seconds: int, bucket_seconds: int = WAIT_BUCKET_SECONDS) -> int:
+    """Put small time differences in the same bucket.
+
+    This prevents the optimizer from making a weird geographic pairing just to save
+    a few minutes of calculated wait time. Auditor time still wins, but once two
+    options are roughly similar for auditors, facility clustering wins.
+    """
+    bucket_seconds = max(1, int(bucket_seconds))
+    return math.ceil(max(0, int(seconds)) / bucket_seconds)
+
+
+def group_compactness_stats(
+    all_auditors: List[AuditorStop],
+    group: List[AuditorStop],
+    time_matrix: List[List[int]],
+    threshold_seconds: int = COMPACT_PAIR_THRESHOLD_SECONDS,
+) -> Dict[str, int]:
+    """Measure whether auditors assigned to one car are actually near each other.
+
+    This is the rule that fixes cases like:
+        Dubai + Al Taweelah in one car
+    when a much more natural pairing exists:
+        Tarmeem + Al Taweelah in one car, Dubai alone
+
+    The numbers are based on facility-to-facility road time, not depot travel time.
+    """
+    if len(group) < 2:
+        return {
+            "max_facility_gap": 0,
+            "total_facility_gap": 0,
+            "far_pair_penalty": 0,
+        }
+
+    pair_times: List[int] = []
+    for left, right in itertools.combinations(group, 2):
+        i = auditor_node(all_auditors, left)
+        j = auditor_node(all_auditors, right)
+        # Road times may be asymmetric. Use the average as a stable closeness score.
+        pair_time = (time_matrix[i][j] + time_matrix[j][i]) // 2
+        pair_times.append(pair_time)
+
+    threshold_seconds = max(0, int(threshold_seconds))
+    far_pair_penalty = sum(max(0, pair_time - threshold_seconds) for pair_time in pair_times)
+    return {
+        "max_facility_gap": max(pair_times, default=0),
+        "total_facility_gap": sum(pair_times),
+        "far_pair_penalty": far_pair_penalty,
+    }
+
+
 def auditor_node(auditors: List[AuditorStop], auditor: AuditorStop) -> int:
     # In the physical matrix, node 0 is depot and auditors are 1..N in input order.
     return auditors.index(auditor) + 1
@@ -672,8 +724,16 @@ def evaluate_group_plan(
             "drive_time": 0,
             "distance": 0,
             "route_span": 0,
+            "max_facility_gap": 0,
+            "total_facility_gap": 0,
+            "far_pair_penalty": 0,
         }
         return route, stats
+
+    compactness = group_compactness_stats(all_auditors, group, time_matrix)
+    max_facility_gap = compactness["max_facility_gap"]
+    total_facility_gap = compactness["total_facility_gap"]
+    far_pair_penalty = compactness["far_pair_penalty"]
 
     best = None
     for morning_tuple in candidate_orders(group):
@@ -745,11 +805,7 @@ def evaluate_group_plan(
             total_drive = morning_drive + pickup_drive
             total_distance = morning_distance + pickup_distance
 
-            nodes_in_group = [auditor_node(all_auditors, a) for a in group]
-            route_span = 0
-            for i in nodes_in_group:
-                for j in nodes_in_group:
-                    route_span = max(route_span, time_matrix[i][j])
+            route_span = max_facility_gap
 
             # Primary objective is auditor experience, not driver convenience.
             # 1) worst single auditor wait, whether in the morning or afternoon
@@ -842,6 +898,9 @@ def evaluate_group_plan(
         "drive_time": route.total_driving_seconds,
         "distance": route.total_distance_meters,
         "route_span": route_span,
+        "max_facility_gap": max_facility_gap,
+        "total_facility_gap": total_facility_gap,
+        "far_pair_penalty": far_pair_penalty,
     }
     return route, stats
 
@@ -878,24 +937,28 @@ def evaluate_assignment(
     total_drive = sum(s["drive_time"] for s in stats_list)
     total_distance = sum(s["distance"] for s in stats_list)
     max_route_span = max((s.get("route_span", 0) for s in stats_list), default=0)
+    max_facility_gap = max((s.get("max_facility_gap", 0) for s in stats_list), default=0)
+    total_facility_gap = sum(s.get("total_facility_gap", 0) for s in stats_list)
+    far_pair_penalty = sum(s.get("far_pair_penalty", 0) for s in stats_list)
 
-    # Auditor-first lexicographic objective:
+    # Auditor-first + compact-cluster objective:
     # 1) use all drivers when requested
-    # 2) minimize the worst total auditor wait, including early drop-off and late pickup
-    # 3) minimize total auditor waiting
-    # 4) avoid very early morning drop-offs
-    # 5) avoid late afternoon pickups
-    # 6) avoid before-midnight / unrealistic morning starts
-    # 7) avoid pairing far-apart facilities on the same driver
-    # 8) reduce driver driving only after auditor time is protected
+    # 2) keep auditor waiting in reasonable buckets, not exact seconds
+    # 3) strongly avoid putting far-apart facilities in the same car
+    # 4) prefer natural nearby clusters, e.g. Tarmeem + Al Taweelah instead of Dubai + Al Taweelah
+    # 5) then reduce exact waiting, return time, and driver driving
     objective = (
         unused_required,
+        objective_bucket(max_auditor_wait),
+        far_pair_penalty,
+        max_facility_gap,
+        total_facility_gap,
+        objective_bucket(total_auditor_wait),
+        objective_bucket(max_morning_early_wait),
+        objective_bucket(max_afternoon_wait),
+        start_deficit,
         max_auditor_wait,
         total_auditor_wait,
-        max_morning_early_wait,
-        max_afternoon_wait,
-        start_deficit,
-        max_route_span,
         latest_return,
         total_drive,
         total_distance,
@@ -917,6 +980,9 @@ def evaluate_assignment(
         "max_pickup_wait": max_afternoon_wait,
         "total_pickup_wait": total_afternoon_wait,
         "morning_start_deficit": start_deficit,
+        "max_facility_gap": max_facility_gap,
+        "total_facility_gap": total_facility_gap,
+        "far_pair_penalty": far_pair_penalty,
     }
     return objective, routes, totals
 
@@ -1146,7 +1212,7 @@ def default_stop_values() -> List[str]:
 
 def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[int]]) -> None:
     st.subheader("Summary")
-    cols = st.columns(8)
+    cols = st.columns(9)
     cols[0].metric("Auditors", totals.get("auditors") or 0)
     cols[1].metric("Drivers used", f"{totals.get('drivers_used') or 0}/{totals.get('driver_count') or 0}")
     cols[2].metric("Latest common morning start", format_clock(totals.get("latest_common_start")))
@@ -1154,7 +1220,8 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
     cols[4].metric("Max auditor wait", format_duration(int(totals.get("max_auditor_wait") or 0)))
     cols[5].metric("Max early drop-off", format_duration(int(totals.get("max_morning_early_wait") or 0)))
     cols[6].metric("Total driving", format_duration(int(totals.get("total_driving_time") or 0)))
-    cols[7].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
+    cols[7].metric("Max same-car gap", format_duration(int(totals.get("max_facility_gap") or 0)))
+    cols[8].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
 
     warnings = []
     for route in routes:
@@ -1248,7 +1315,7 @@ def main() -> None:
         st.divider()
         st.caption("Morning arrival = when the auditor must reach the facility.")
         st.caption("Can leave = when the auditor can leave work, usually 16:00 or 17:00.")
-        st.caption("Auditor-priority mode: use all drivers, minimize post-work auditor waiting, then reduce driver driving.")
+        st.caption("Auditor-priority mode: use all drivers, keep auditor waiting low, then cluster nearby facilities before reducing driver driving.")
 
     defaults = default_stop_values()
 
@@ -1278,7 +1345,7 @@ def main() -> None:
         )
     with second_cols[1]:
         st.info(
-            "There is no hard latest-pickup field now. The optimizer now prioritizes auditor waiting time first. Driver driving time is only optimized after auditor waiting is minimized."
+            "The optimizer now prioritizes auditor time, then keeps same-car facilities geographically close. This is meant to avoid pairings like Dubai + Al Taweelah when Al Taweelah can go with a nearby Abu Dhabi facility."
         )
 
     st.markdown("### Auditors / facilities")
