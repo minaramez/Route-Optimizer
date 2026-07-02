@@ -94,9 +94,15 @@ APP_USER_AGENT = get_secret_or_env(
 )
 GEOCODE_DELAY_SECONDS = float_setting("GEOCODE_DELAY_SECONDS", 1.05)
 MAX_OSRM_LOCATIONS = int_setting("MAX_OSRM_LOCATIONS", 80)
-APP_STATE_VERSION = "2026-07-02-v8-compact-same-car-clustering"
+APP_STATE_VERSION = "2026-07-02-v9-outbound-route-order"
 WAIT_BUCKET_SECONDS = int_setting("WAIT_BUCKET_SECONDS", 600)
 COMPACT_PAIR_THRESHOLD_SECONDS = int_setting("COMPACT_PAIR_THRESHOLD_SECONDS", 45 * 60)
+# Morning route sanity: if facilities have similar arrival deadlines, do not drive past
+# a closer facility to a farther one and then backtrack. A farther stop may still go
+# first when it has a meaningfully earlier arrival time.
+OUTBOUND_BACKTRACK_GRACE_SECONDS = int_setting("OUTBOUND_BACKTRACK_GRACE_SECONDS", 10 * 60)
+EARLIER_DEADLINE_OVERRIDES_BACKTRACK_SECONDS = int_setting("EARLIER_DEADLINE_OVERRIDES_BACKTRACK_SECONDS", 20 * 60)
+MORNING_EARLY_WAIT_COMFORT_SECONDS = int_setting("MORNING_EARLY_WAIT_COMFORT_SECONDS", 90 * 60)
 
 
 def reset_stale_session_state() -> None:
@@ -542,6 +548,45 @@ def group_compactness_stats(
     }
 
 
+def morning_outbound_backtrack_penalty(
+    all_auditors: List[AuditorStop],
+    order: List[AuditorStop],
+    time_matrix: List[List[int]],
+) -> int:
+    """Penalize morning routes that drive outward, then back toward the depot.
+
+    Example this is meant to prevent:
+        Depot -> Al Taweelah -> Tarmeem
+    when Tarmeem is on the way from the depot to Al Taweelah and both audits start
+    at roughly the same time.
+
+    The penalty is waived when the farther stop has a meaningfully earlier arrival
+    deadline, because then the backtrack may be necessary operationally.
+    """
+    if len(order) < 2:
+        return 0
+
+    penalty = 0
+    for current, nxt in zip(order, order[1:]):
+        current_node = auditor_node(all_auditors, current)
+        next_node = auditor_node(all_auditors, nxt)
+
+        current_from_depot = time_matrix[0][current_node]
+        next_from_depot = time_matrix[0][next_node]
+        backtrack_seconds = current_from_depot - next_from_depot
+
+        # If the current/farther auditor has a much earlier start time, allow it.
+        current_is_much_earlier = (
+            nxt.arrival_deadline_seconds - current.arrival_deadline_seconds
+            >= EARLIER_DEADLINE_OVERRIDES_BACKTRACK_SECONDS
+        )
+
+        if backtrack_seconds > OUTBOUND_BACKTRACK_GRACE_SECONDS and not current_is_much_earlier:
+            penalty += backtrack_seconds
+
+    return penalty
+
+
 def auditor_node(auditors: List[AuditorStop], auditor: AuditorStop) -> int:
     # In the physical matrix, node 0 is depot and auditors are 1..N in input order.
     return auditors.index(auditor) + 1
@@ -727,6 +772,7 @@ def evaluate_group_plan(
             "max_facility_gap": 0,
             "total_facility_gap": 0,
             "far_pair_penalty": 0,
+            "morning_backtrack_penalty": 0,
         }
         return route, stats
 
@@ -764,6 +810,12 @@ def evaluate_group_plan(
         total_morning_early_wait = sum(morning_early_waits)
         morning_drive = elapsed
         morning_distance = route_drive_distance(morning_nodes, distance_matrix)
+        morning_backtrack_penalty = morning_outbound_backtrack_penalty(
+            all_auditors, morning_order, time_matrix
+        )
+        morning_early_wait_excess = max(
+            0, max_morning_early_wait - MORNING_EARLY_WAIT_COMFORT_SECONDS
+        )
 
         # Afternoon starts from the final morning drop-off. The driver can wait there,
         # but auditors should not wait much after their Can leave time.
@@ -807,20 +859,26 @@ def evaluate_group_plan(
 
             route_span = max_facility_gap
 
-            # Primary objective is auditor experience, not driver convenience.
-            # 1) worst single auditor wait, whether in the morning or afternoon
-            # 2) total auditor waiting
-            # 3) specifically avoid very-early morning drop-offs
-            # 4) specifically avoid very-late afternoon pickups
-            # 5) avoid impossible / before-midnight starts
-            # 6) avoid grouping facilities that are far apart on the same route
-            # 7) then consider return time and driving time
+            # Primary objective is auditor experience, but the morning direction
+            # must still make operational sense. If two stops have similar start
+            # times, do not pass a nearby facility, go to the far one, then come
+            # back. Only allow that when the farther stop has a much earlier
+            # required arrival time.
+            #
+            # Ordering priorities inside one car:
+            # 1) avoid impossible / before-midnight starts
+            # 2) avoid late afternoon pickups
+            # 3) avoid extreme early morning drop-offs beyond a comfort threshold
+            # 4) avoid outbound backtracking in the morning
+            # 5) then reduce exact waiting and driving
             objective = (
+                start_deficit,
+                max_afternoon_wait,
+                morning_early_wait_excess,
+                morning_backtrack_penalty,
                 max_auditor_wait,
                 total_auditor_wait,
                 max_morning_early_wait,
-                max_afternoon_wait,
-                start_deficit,
                 route_span,
                 return_depot_time,
                 total_drive,
@@ -845,6 +903,7 @@ def evaluate_group_plan(
                     total_auditor_wait,
                     start_deficit,
                     route_span,
+                    morning_backtrack_penalty,
                 )
 
     assert best is not None
@@ -866,6 +925,7 @@ def evaluate_group_plan(
         total_auditor_wait,
         start_deficit,
         route_span,
+        morning_backtrack_penalty,
     ) = best
 
     morning_points = [depot] + [auditor.facility for auditor in morning_order]
@@ -901,6 +961,7 @@ def evaluate_group_plan(
         "max_facility_gap": max_facility_gap,
         "total_facility_gap": total_facility_gap,
         "far_pair_penalty": far_pair_penalty,
+        "morning_backtrack_penalty": morning_backtrack_penalty,
     }
     return route, stats
 
@@ -940,8 +1001,9 @@ def evaluate_assignment(
     max_facility_gap = max((s.get("max_facility_gap", 0) for s in stats_list), default=0)
     total_facility_gap = sum(s.get("total_facility_gap", 0) for s in stats_list)
     far_pair_penalty = sum(s.get("far_pair_penalty", 0) for s in stats_list)
+    morning_backtrack_penalty = sum(s.get("morning_backtrack_penalty", 0) for s in stats_list)
 
-    # Auditor-first + compact-cluster objective:
+    # Auditor-first + compact-cluster + outbound-direction objective:
     # 1) use all drivers when requested
     # 2) keep auditor waiting in reasonable buckets, not exact seconds
     # 3) strongly avoid putting far-apart facilities in the same car
@@ -951,6 +1013,7 @@ def evaluate_assignment(
         unused_required,
         objective_bucket(max_auditor_wait),
         far_pair_penalty,
+        morning_backtrack_penalty,
         max_facility_gap,
         total_facility_gap,
         objective_bucket(total_auditor_wait),
@@ -983,6 +1046,7 @@ def evaluate_assignment(
         "max_facility_gap": max_facility_gap,
         "total_facility_gap": total_facility_gap,
         "far_pair_penalty": far_pair_penalty,
+        "morning_backtrack_penalty": morning_backtrack_penalty,
     }
     return objective, routes, totals
 
@@ -1345,7 +1409,7 @@ def main() -> None:
         )
     with second_cols[1]:
         st.info(
-            "The optimizer now prioritizes auditor time, then keeps same-car facilities geographically close. This is meant to avoid pairings like Dubai + Al Taweelah when Al Taweelah can go with a nearby Abu Dhabi facility."
+            "The optimizer prioritizes auditor time, keeps same-car facilities geographically close, and avoids morning backtracking. For example, if Tarmeem is on the way to Al Taweelah and their audit start times are similar, Tarmeem should be dropped first."
         )
 
     st.markdown("### Auditors / facilities")
