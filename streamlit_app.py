@@ -22,8 +22,8 @@ import streamlit as st
 
 # Google Maps route logo button sizing.
 # Increase/decrease these numbers to resize the rectangular button.
-GOOGLE_LOGO_BUTTON_WIDTH = 210
-GOOGLE_LOGO_BUTTON_HEIGHT = 82
+GOOGLE_LOGO_BUTTON_WIDTH = 180
+GOOGLE_LOGO_BUTTON_HEIGHT = 70
 GOOGLE_LOGO_IMAGE_WIDTH = 165
 
 
