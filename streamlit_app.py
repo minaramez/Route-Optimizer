@@ -1390,7 +1390,7 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
 
 
 def main() -> None:
-    st.set_page_config(page_title="Multi-Driver Auditor Route Optimizer", page_icon="🚗", layout="wide")
+    st.set_page_config(page_title="Route Optimizer", page_icon="🚗", layout="wide")
     require_password_if_configured()
     reset_stale_session_state()
 
