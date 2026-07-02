@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import hmac
 import math
@@ -738,7 +739,7 @@ def main() -> None:
         with c1:
             driver_count = st.number_input("Number of drivers", min_value=1, value=4, step=1)
         with c2:
-            deadline = st.time_input("Latest arrival time", value=time.strptime("09:15", "%H:%M"))
+            deadline = st.time_input("Latest arrival time", value=datetime.time(9, 15))
         with c3:
             depot_input = st.text_input(
                 "Depot / office / starting point (optional)",
