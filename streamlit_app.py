@@ -21,14 +21,14 @@ import streamlit as st
 # -----------------------------------------------------------------------------
 
 # Google Maps route logo button sizing.
-# Increase/decrease these numbers to resize the rectangular button.
-GOOGLE_LOGO_BUTTON_WIDTH = 210
-GOOGLE_LOGO_BUTTON_HEIGHT = 82
-GOOGLE_LOGO_IMAGE_WIDTH = 165
+# Increase/decrease this one value to resize the rectangular logo button.
+GOOGLE_LOGO_IMAGE_WIDTH = 260
+GOOGLE_LOGO_BUTTON_PADDING_Y = 6
+GOOGLE_LOGO_BUTTON_PADDING_X = 10
 
 
 def render_google_maps_logo_button(url: str) -> None:
-    """Render a centered, rectangular Google Maps logo route button."""
+    """Render a centered Google Maps logo link with a tight border around the image."""
     logo_path = os.path.join(os.path.dirname(__file__), "google.png")
     safe_url = html.escape(url, quote=True)
 
@@ -38,30 +38,29 @@ def render_google_maps_logo_button(url: str) -> None:
         logo_html = (
             f'<img src="data:image/png;base64,{encoded_logo}" '
             f'alt="Open route in Google Maps" '
-            f'style="width:{GOOGLE_LOGO_IMAGE_WIDTH}px; height:auto; max-height:{GOOGLE_LOGO_BUTTON_HEIGHT - 22}px; object-fit:contain; display:block;" />'
+            f'style="width:{GOOGLE_LOGO_IMAGE_WIDTH}px; height:auto; object-fit:contain; display:block;" />'
         )
     else:
         logo_html = (
-            '<span style="font-size:18px; font-weight:600; color:#1f1f1f; white-space:nowrap;">🗺️ Google Maps</span>'
+            '<span style="font-size:22px; font-weight:600; color:#1f1f1f; white-space:nowrap;">🗺️ Google Maps</span>'
         )
 
     st.markdown(
         f"""
-        <div style="display:flex; justify-content:center; width:100%; margin:0.65rem 0 1.15rem 0;">
+        <div style="display:flex; justify-content:center; align-items:center; width:100%; margin:0.55rem 0 1.05rem 0;">
             <a href="{safe_url}" target="_blank" rel="noopener noreferrer" title="Open route in Google Maps"
                style="
                     display:inline-flex;
                     align-items:center;
                     justify-content:center;
-                    width:{GOOGLE_LOGO_BUTTON_WIDTH}px;
-                    height:{GOOGLE_LOGO_BUTTON_HEIGHT}px;
-                    padding:10px 18px;
-                    border:1px solid rgba(60, 64, 67, 0.28);
-                    border-radius:16px;
+                    padding:{GOOGLE_LOGO_BUTTON_PADDING_Y}px {GOOGLE_LOGO_BUTTON_PADDING_X}px;
+                    border:1px solid rgba(60, 64, 67, 0.24);
+                    border-radius:14px;
                     background:#ffffff;
-                    box-shadow:0 2px 8px rgba(60, 64, 67, 0.16);
+                    box-shadow:0 2px 7px rgba(60, 64, 67, 0.14);
                     text-decoration:none;
                     box-sizing:border-box;
+                    line-height:0;
                ">
                 {logo_html}
             </a>
