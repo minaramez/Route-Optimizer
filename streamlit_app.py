@@ -20,7 +20,7 @@ import streamlit as st
 # Frontend settings
 # -----------------------------------------------------------------------------
 
-GOOGLE_LOGO_BUTTON_SIZE = 44  # Change this number to resize the Google Maps logo button.
+GOOGLE_LOGO_BUTTON_SIZE = 65  # Change this number to resize the Google Maps logo button.
 
 
 def render_google_maps_logo_button(url: str) -> None:
