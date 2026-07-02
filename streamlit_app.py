@@ -24,6 +24,7 @@ class Location:
     lat: float
     lng: float
     original_input: str
+    arrival_deadline_seconds: Optional[int] = None
 
 
 @dataclass
@@ -408,6 +409,7 @@ def solve_vrp(
     return_to_depot: bool,
     use_virtual_depot: bool,
     finish_deadline_seconds: Optional[int] = None,
+    require_all_drivers_if_possible: bool = True,
 ) -> List[DriverRoute]:
     if driver_count < 1:
         raise ValueError("Driver count must be at least 1.")
@@ -445,6 +447,15 @@ def solve_vrp(
     # This minimizes the longest driver's route, not equal stop counts.
     # Arc cost remains as a smaller tie-breaker against unnecessary driving.
     time_dimension.SetGlobalSpanCostCoefficient(1_000_000)
+
+    # For this use case, an unused driver can cause auditors to wait unnecessarily
+    # while another driver handles multiple far-away stops. If there are at least
+    # as many stops as drivers, force every driver to get at least one stop.
+    if require_all_drivers_if_possible:
+        vehicles_to_force = min(driver_count, len(locations) - 1)
+        solver = routing.solver()
+        for vehicle_id in range(vehicles_to_force):
+            solver.Add(routing.NextVar(routing.Start(vehicle_id)) != routing.End(vehicle_id))
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
@@ -485,9 +496,23 @@ def solve_vrp(
 
         latest_start_seconds = None
         stop_arrival_seconds = None
-        if finish_deadline_seconds is not None:
-            latest_start_seconds = finish_deadline_seconds - route_seconds
-            stop_arrival_seconds = [latest_start_seconds + offset for offset in arrival_offsets]
+        if route_nodes:
+            latest_start_candidates: List[int] = []
+            for node, offset in zip(route_nodes, arrival_offsets):
+                stop_deadline = locations[node].arrival_deadline_seconds
+                if stop_deadline is None:
+                    stop_deadline = finish_deadline_seconds
+                if stop_deadline is not None:
+                    latest_start_candidates.append(stop_deadline - offset)
+
+            if latest_start_candidates:
+                # Start as late as possible while still reaching every assigned auditor/facility
+                # by that stop's own arrival time.
+                latest_start_seconds = min(latest_start_candidates)
+                stop_arrival_seconds = [latest_start_seconds + offset for offset in arrival_offsets]
+        elif finish_deadline_seconds is not None:
+            latest_start_seconds = finish_deadline_seconds
+            stop_arrival_seconds = []
 
         driver_routes.append(
             DriverRoute(
@@ -557,15 +582,19 @@ def format_distance(meters: int) -> str:
 
 
 def parse_time_of_day(value: str) -> int:
-    value = (value or "09:15").strip()
+    value = (value or "09:00").strip()
     match = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
     if not match:
-        raise ValueError("Deadline must be in HH:MM format, for example 09:15.")
+        raise ValueError("Time must be in HH:MM format, for example 09:00.")
     hours = int(match.group(1))
     minutes = int(match.group(2))
     if not (0 <= hours <= 23 and 0 <= minutes <= 59):
-        raise ValueError("Deadline must be a valid time of day.")
+        raise ValueError("Time must be a valid time of day.")
     return hours * 3600 + minutes * 60
+
+
+def seconds_from_time(value: datetime.time) -> int:
+    return value.hour * 3600 + value.minute * 60
 
 
 def format_clock(seconds: Optional[int]) -> str:
@@ -591,22 +620,24 @@ def format_clock(seconds: Optional[int]) -> str:
 # Streamlit UI
 # -----------------------------------------------------------------------------
 
+
 def optimize_routes(
-    locations_text: str,
+    stop_rows: List[Tuple[str, int]],
     depot_input: str,
     driver_count: int,
     return_to_depot: bool,
-    deadline: str,
+    require_all_drivers_if_possible: bool,
+    default_arrival_deadline_seconds: int,
 ) -> Tuple[List[DriverRoute], Dict[str, Optional[int]]]:
-    lines = [line.strip() for line in locations_text.splitlines() if line.strip()]
-    if not lines:
-        raise ValueError("Paste at least one Google Maps link, coordinate, or address.")
+    cleaned_rows = [(raw.strip(), deadline) for raw, deadline in stop_rows if raw.strip()]
+    if not cleaned_rows:
+        raise ValueError("Add at least one Google Maps link, coordinate, or address.")
 
-    if driver_count > len(lines):
-        driver_count = len(lines)
-
-    stop_locations = [parse_location(line, idx + 1) for idx, line in enumerate(lines)]
-    finish_deadline_seconds = parse_time_of_day(deadline)
+    stop_locations: List[Location] = []
+    for idx, (raw, deadline_seconds) in enumerate(cleaned_rows, start=1):
+        loc = parse_location(raw, idx)
+        loc.arrival_deadline_seconds = deadline_seconds
+        stop_locations.append(loc)
 
     if depot_input.strip():
         depot = parse_location(depot_input.strip(), 0, label_prefix="Depot")
@@ -628,30 +659,53 @@ def optimize_routes(
         driver_count,
         return_to_depot,
         use_virtual_depot,
-        finish_deadline_seconds,
+        default_arrival_deadline_seconds,
+        require_all_drivers_if_possible=require_all_drivers_if_possible,
     )
 
-    longest_route_seconds = max((route.travel_seconds for route in routes), default=0)
+    used_routes = [route for route in routes if route.stops]
+    longest_route_seconds = max((route.travel_seconds for route in used_routes), default=0)
+    latest_common_start_candidates = [
+        route.latest_start_seconds for route in used_routes if route.latest_start_seconds is not None
+    ]
+    latest_common_start = min(latest_common_start_candidates) if latest_common_start_candidates else None
+    earliest_deadline = min((loc.arrival_deadline_seconds or default_arrival_deadline_seconds) for loc in stop_locations)
+    latest_deadline = max((loc.arrival_deadline_seconds or default_arrival_deadline_seconds) for loc in stop_locations)
+
     totals: Dict[str, Optional[int]] = {
-        "time": sum(route.travel_seconds for route in routes),
-        "distance": sum(route.travel_meters for route in routes),
-        "stops": sum(len(route.stops) for route in routes),
+        "time": sum(route.travel_seconds for route in used_routes),
+        "distance": sum(route.travel_meters for route in used_routes),
+        "stops": sum(len(route.stops) for route in used_routes),
+        "drivers_used": len(used_routes),
+        "driver_count": driver_count,
         "longest_route": longest_route_seconds,
-        "latest_common_start": finish_deadline_seconds - longest_route_seconds if routes else None,
-        "deadline": finish_deadline_seconds,
+        "latest_common_start": latest_common_start,
+        "earliest_deadline": earliest_deadline,
+        "latest_deadline": latest_deadline,
     }
     return routes, totals
 
 
 def render_results(routes: List[DriverRoute], totals: Dict[str, Optional[int]]) -> None:
     st.subheader("Summary")
-    cols = st.columns(6)
+    cols = st.columns(7)
     cols[0].metric("Total stops", totals.get("stops") or 0)
-    cols[1].metric("Longest driver route", format_duration(int(totals.get("longest_route") or 0)))
-    cols[2].metric("Latest common start", format_clock(totals.get("latest_common_start")))
-    cols[3].metric("Deadline", format_clock(totals.get("deadline")))
-    cols[4].metric("Total driving time", format_duration(int(totals.get("time") or 0)))
-    cols[5].metric("Total distance", format_distance(int(totals.get("distance") or 0)))
+    cols[1].metric("Drivers used", f"{totals.get('drivers_used') or 0}/{totals.get('driver_count') or 0}")
+    cols[2].metric("Longest driver route", format_duration(int(totals.get("longest_route") or 0)))
+    cols[3].metric("Latest common start", format_clock(totals.get("latest_common_start")))
+    cols[4].metric(
+        "Arrival window",
+        f"{format_clock(totals.get('earliest_deadline'))}–{format_clock(totals.get('latest_deadline'))}",
+    )
+    cols[5].metric("Total driving time", format_duration(int(totals.get("time") or 0)))
+    cols[6].metric("Total distance", format_distance(int(totals.get("distance") or 0)))
+
+    warnings = []
+    for route in routes:
+        if route.stops and route.latest_start_seconds is not None and route.latest_start_seconds < 0:
+            warnings.append(f"Driver {route.driver_number} would need to start before midnight to satisfy all arrival times.")
+    if warnings:
+        st.warning(" ".join(warnings))
 
     st.subheader("Driver routes")
     for route in routes:
@@ -663,18 +717,14 @@ def render_results(routes: List[DriverRoute], totals: Dict[str, Optional[int]]) 
                     f"{len(route.stops)} stops · {format_duration(route.travel_seconds)} · "
                     f"{format_distance(route.travel_meters)}"
                 )
-                if route.latest_start_seconds is not None:
-                    st.write(
-                        "Start at latest: "
-                        f"**{format_clock(route.latest_start_seconds)}** → finish by "
-                        f"**{format_clock(route.finish_deadline_seconds)}**"
-                    )
+                if route.latest_start_seconds is not None and route.stops:
+                    st.write(f"Start at latest: **{format_clock(route.latest_start_seconds)}**")
             with right:
                 if route.google_maps_url:
                     st.link_button("Open route in Google Maps", route.google_maps_url, use_container_width=True)
 
             if not route.stops:
-                st.caption("No stops assigned.")
+                st.caption("No stops assigned. This should only happen when there are more drivers than stops, or when 'force all drivers' is off.")
                 continue
 
             rows = []
@@ -682,10 +732,12 @@ def render_results(routes: List[DriverRoute], totals: Dict[str, Optional[int]]) 
                 eta = ""
                 if route.stop_arrival_seconds:
                     eta = format_clock(route.stop_arrival_seconds[idx - 1])
+                deadline = stop.arrival_deadline_seconds
                 rows.append(
                     {
                         "#": idx,
                         "Stop": stop.label,
+                        "Arrive by": format_clock(deadline),
                         "ETA if leaving at latest start": eta,
                         "Coordinates": f"{stop.lat:.6f}, {stop.lng:.6f}",
                         "Original input": stop.original_input,
@@ -694,14 +746,27 @@ def render_results(routes: List[DriverRoute], totals: Dict[str, Optional[int]]) 
             st.dataframe(rows, hide_index=True, use_container_width=True)
 
 
+def _default_stop_values() -> List[str]:
+    return [
+        "25.221375, 55.285106",
+        "24.782154, 54.738854",
+        "24.398153, 54.554717",
+        "24.222244, 55.695169",
+        "24.219594, 55.776045",
+        "23.659065, 53.725112",
+        "23.132777, 53.799145",
+        "23.915126, 52.803821",
+    ]
+
+
 def main() -> None:
     st.set_page_config(page_title="Multi-Driver Route Optimizer", page_icon="🚗", layout="wide")
     require_password_if_configured()
 
     st.title("Multi-Driver Route Optimizer")
     st.caption(
-        "Paste Google Maps links, addresses, or coordinates. Choose driver count. "
-        "Get optimized driver routes without a paid API key."
+        "Plan auditor drop-offs/pickups with multiple drivers. Each stop can have its own required arrival time. "
+        "No paid Google API key is required."
     )
 
     with st.sidebar:
@@ -712,56 +777,91 @@ def main() -> None:
         else:
             st.caption("Using straight-line estimates only.")
         st.divider()
-        st.caption("Tip: coordinates are fastest and most reliable: `24.4539,54.3773`.")
+        st.caption("For morning drop-offs: arrival time means the auditor must reach the facility by that time.")
+        st.caption("For afternoon pickup planning: use the facility as the stop and set the arrival time to the latest pickup time, e.g. 17:00.")
 
-    default_locations = "\n".join(
-        [
-            "25.221375, 55.285106",
-            "24.782154, 54.738854",
-            "24.398153, 54.554717",
-            "24.222244, 55.695169",
-            "24.219594, 55.776045",
-            "23.659065, 53.725112",
-            "23.132777, 53.799145",
-            "23.915126, 52.803821",
-        ]
+    defaults = _default_stop_values()
+
+    st.markdown("### Trip setup")
+    trip_mode = st.radio(
+        "Trip type",
+        ["Morning drop-off", "Afternoon pickup / return"],
+        horizontal=True,
+        help="The optimizer is the same, but this changes the default return-to-depot behavior and labels.",
     )
 
-    with st.form("route_form"):
-        locations_text = st.text_area(
-            "Stops - one per line",
-            value=st.session_state.get("locations_text", default_locations),
-            height=260,
-            help="Supports coordinates, Google Maps links, short maps.app.goo.gl links, or plain addresses.",
+    c_top1, c_top2, c_top3, c_top4 = st.columns([1, 1, 1, 2])
+    with c_top1:
+        stop_count = st.number_input("Number of stops", min_value=1, max_value=40, value=7, step=1)
+    with c_top2:
+        driver_count = st.number_input("Number of drivers", min_value=1, max_value=20, value=4, step=1)
+    with c_top3:
+        default_time = st.time_input("Default arrival time", value=datetime.time(9, 0))
+    with c_top4:
+        depot_input = st.text_input(
+            "Depot / office / starting point",
+            value=st.session_state.get("depot_input", "24.485451, 54.381805"),
+            placeholder="Office address, coordinates, or Google Maps link",
         )
 
-        c1, c2, c3 = st.columns([1, 1, 3])
-        with c1:
-            driver_count = st.number_input("Number of drivers", min_value=1, value=4, step=1)
-        with c2:
-            deadline = st.time_input("Latest arrival time", value=datetime.time(9, 15))
-        with c3:
-            depot_input = st.text_input(
-                "Depot / office / starting point (optional)",
-                value=st.session_state.get("depot_input", "24.485451, 54.381805"),
-                placeholder="Office address, coordinates, or Google Maps link",
-            )
+    default_return_to_depot = trip_mode == "Afternoon pickup / return"
+    c_opts1, c_opts2 = st.columns([1, 2])
+    with c_opts1:
+        return_to_depot = st.checkbox(
+            "Include return to depot in route cost",
+            value=default_return_to_depot,
+            help="For morning drop-offs this is usually off. For afternoon pickups/returns this is usually on.",
+        )
+    with c_opts2:
+        require_all_drivers_if_possible = st.checkbox(
+            "Use all available drivers when possible",
+            value=True,
+            help="If there are at least as many stops as drivers, every driver will get at least one stop.",
+        )
 
-        return_to_depot = st.checkbox("Return drivers to depot at the end", value=True)
+    st.markdown("### Stops")
+    st.caption("One Google Maps link / address / coordinate per row. If you leave arrival time unchanged, it defaults to the time above.")
+
+    stop_rows: List[Tuple[str, int]] = []
+    with st.form("route_form"):
+        header = st.columns([0.4, 4, 1.2])
+        header[0].markdown("**#**")
+        header[1].markdown("**Google Maps link / coordinates / address**")
+        header[2].markdown("**Arrive by**")
+
+        default_arrival_seconds = seconds_from_time(default_time)
+        for idx in range(1, int(stop_count) + 1):
+            row = st.columns([0.4, 4, 1.2])
+            row[0].write(idx)
+            default_value = defaults[idx - 1] if idx <= len(defaults) else ""
+            raw = row[1].text_input(
+                f"Stop {idx}",
+                value=default_value,
+                label_visibility="collapsed",
+                placeholder="https://maps.app.goo.gl/... or 24.4539,54.3773",
+                key=f"stop_input_{idx}",
+            )
+            arrival_time = row[2].time_input(
+                f"Arrival time {idx}",
+                value=default_time,
+                label_visibility="collapsed",
+                key=f"arrival_time_{idx}",
+            )
+            stop_rows.append((raw, seconds_from_time(arrival_time)))
+
         submitted = st.form_submit_button("Optimize routes", type="primary")
 
     if submitted:
-        st.session_state["locations_text"] = locations_text
         st.session_state["depot_input"] = depot_input
-        deadline_str = deadline.strftime("%H:%M")
         try:
             with st.spinner("Parsing locations, fetching route matrix, and optimizing routes..."):
                 routes, totals = optimize_routes(
-                    locations_text=locations_text,
+                    stop_rows=stop_rows,
                     depot_input=depot_input,
                     driver_count=int(driver_count),
                     return_to_depot=return_to_depot,
-                    deadline=deadline_str,
+                    require_all_drivers_if_possible=require_all_drivers_if_possible,
+                    default_arrival_deadline_seconds=default_arrival_seconds,
                 )
             st.session_state["routes"] = routes
             st.session_state["totals"] = totals
