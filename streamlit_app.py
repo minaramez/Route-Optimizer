@@ -1,4 +1,6 @@
+import base64
 import datetime
+import html
 import hashlib
 import itertools
 import hmac
@@ -12,6 +14,54 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 import streamlit as st
+
+
+# -----------------------------------------------------------------------------
+# Frontend settings
+# -----------------------------------------------------------------------------
+
+GOOGLE_LOGO_BUTTON_SIZE = 44  # Change this number to resize the Google Maps logo button.
+
+
+def render_google_maps_logo_button(url: str) -> None:
+    """Render an icon-only Google Maps route button."""
+    logo_path = os.path.join(os.path.dirname(__file__), "google.png")
+    safe_url = html.escape(url, quote=True)
+
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as image_file:
+            encoded_logo = base64.b64encode(image_file.read()).decode("utf-8")
+        logo_html = (
+            f'<img src="data:image/png;base64,{encoded_logo}" '
+            f'alt="Open route in Google Maps" '
+            f'style="width:{GOOGLE_LOGO_BUTTON_SIZE}px; height:{GOOGLE_LOGO_BUTTON_SIZE}px; object-fit:contain; display:block;" />'
+        )
+    else:
+        logo_html = (
+            f'<span style="font-size:{GOOGLE_LOGO_BUTTON_SIZE - 8}px; line-height:{GOOGLE_LOGO_BUTTON_SIZE}px;">🗺️</span>'
+        )
+
+    st.markdown(
+        f"""
+        <a href="{safe_url}" target="_blank" rel="noopener noreferrer" title="Open route in Google Maps"
+           style="
+                display:inline-flex;
+                align-items:center;
+                justify-content:center;
+                width:{GOOGLE_LOGO_BUTTON_SIZE + 18}px;
+                height:{GOOGLE_LOGO_BUTTON_SIZE + 18}px;
+                padding:8px;
+                border:1px solid rgba(49, 51, 63, 0.22);
+                border-radius:16px;
+                background:#ffffff;
+                box-shadow:0 2px 8px rgba(0, 0, 0, 0.08);
+                text-decoration:none;
+           ">
+            {logo_html}
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1314,15 +1364,7 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
                 continue
 
             if route.morning_google_url:
-                logo_path = os.path.join(os.path.dirname(__file__), "google.png")
-                link_cols = st.columns([0.08, 0.92])
-                with link_cols[0]:
-                    if os.path.exists(logo_path):
-                        st.image(logo_path, width=28)
-                    else:
-                        st.markdown("🗺️")
-                with link_cols[1]:
-                    st.link_button("Open Morning drop-off route", route.morning_google_url, use_container_width=True)
+                render_google_maps_logo_button(route.morning_google_url)
 
             st.markdown("**Morning drop-off sequence**")
             morning_rows = []
