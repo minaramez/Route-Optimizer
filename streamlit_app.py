@@ -1276,16 +1276,13 @@ def default_stop_values() -> List[str]:
 
 def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[int]]) -> None:
     st.subheader("Summary")
-    cols = st.columns(9)
+    cols = st.columns(6)
     cols[0].metric("Auditors", totals.get("auditors") or 0)
     cols[1].metric("Drivers used", f"{totals.get('drivers_used') or 0}/{totals.get('driver_count') or 0}")
-    cols[2].metric("Latest common morning start", format_clock(totals.get("latest_common_start")))
-    cols[3].metric("Latest depot return", format_clock(totals.get("latest_return")))
-    cols[4].metric("Max auditor wait", format_duration(int(totals.get("max_auditor_wait") or 0)))
-    cols[5].metric("Max early drop-off", format_duration(int(totals.get("max_morning_early_wait") or 0)))
-    cols[6].metric("Total driving", format_duration(int(totals.get("total_driving_time") or 0)))
-    cols[7].metric("Max same-car gap", format_duration(int(totals.get("max_facility_gap") or 0)))
-    cols[8].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
+    cols[2].metric("Latest depot return", format_clock(totals.get("latest_return")))
+    cols[3].metric("Max early drop-off", format_duration(int(totals.get("max_morning_early_wait") or 0)))
+    cols[4].metric("Total driving", format_duration(int(totals.get("total_driving_time") or 0)))
+    cols[5].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
 
     warnings = []
     for route in routes:
@@ -1311,19 +1308,21 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
                 f"{format_distance(route.total_distance_meters)}"
             )
             if route.auditors:
-                st.write(
-                    f"Morning start at latest: **{format_clock(route.latest_morning_start_seconds)}** · "
-                    f"Return to depot around: **{format_clock(route.return_depot_seconds)}**"
-                )
+                st.write(f"Morning start at latest: **{format_clock(route.latest_morning_start_seconds)}**")
             else:
                 st.caption("No auditors assigned. This should only happen if there are more drivers than auditors, or if force-all-drivers is off.")
                 continue
 
-            link_cols = st.columns(2)
             if route.morning_google_url:
-                link_cols[0].link_button("Open morning drop-off route", route.morning_google_url, use_container_width=True)
-            if route.pickup_google_url:
-                link_cols[1].link_button("Open afternoon pickup route", route.pickup_google_url, use_container_width=True)
+                logo_path = os.path.join(os.path.dirname(__file__), "google.png")
+                link_cols = st.columns([0.08, 0.92])
+                with link_cols[0]:
+                    if os.path.exists(logo_path):
+                        st.image(logo_path, width=28)
+                    else:
+                        st.markdown("🗺️")
+                with link_cols[1]:
+                    st.link_button("Open Morning drop-off route", route.morning_google_url, use_container_width=True)
 
             st.markdown("**Morning drop-off sequence**")
             morning_rows = []
@@ -1340,22 +1339,6 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
                 )
             st.dataframe(morning_rows, hide_index=True, use_container_width=True)
 
-            st.markdown("**Afternoon pickup sequence**")
-            pickup_rows = []
-            for idx, auditor in enumerate(route.pickup_order, start=1):
-                pickup_time = route.pickup_times.get(auditor.label)
-                wait_seconds = max(0, (pickup_time or 0) - auditor.pickup_earliest_seconds) if pickup_time is not None else 0
-                pickup_rows.append(
-                    {
-                        "#": idx,
-                        "Auditor/facility": auditor.label,
-                        "Can leave from": format_clock(auditor.pickup_earliest_seconds),
-                        "Planned pickup": format_clock(pickup_time),
-                        "Wait after leave time": format_duration(wait_seconds),
-                        "Coordinates": f"{auditor.facility.lat:.6f}, {auditor.facility.lng:.6f}",
-                    }
-                )
-            st.dataframe(pickup_rows, hide_index=True, use_container_width=True)
 
 
 def main() -> None:
@@ -1400,17 +1383,11 @@ def main() -> None:
             placeholder="Office address, coordinates, or Google Maps link",
         )
 
-    second_cols = st.columns([1, 2])
-    with second_cols[0]:
-        require_all_drivers = st.checkbox(
-            "Use all drivers when possible",
-            value=True,
-            help="If auditors >= drivers, every driver is forced to handle at least one auditor.",
-        )
-    with second_cols[1]:
-        st.info(
-            "The optimizer prioritizes auditor time, keeps same-car facilities geographically close, and avoids morning backtracking. For example, if Tarmeem is on the way to Al Taweelah and their audit start times are similar, Tarmeem should be dropped first."
-        )
+    require_all_drivers = st.checkbox(
+        "Use all drivers when possible",
+        value=True,
+        help="If auditors >= drivers, every driver is forced to handle at least one auditor.",
+    )
 
     st.markdown("### Auditors / facilities")
     st.caption("Each row is one auditor's facility. The same driver that drops this auditor off will pick them up again.")
