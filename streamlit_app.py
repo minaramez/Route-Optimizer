@@ -24,19 +24,31 @@ class Location:
     lat: float
     lng: float
     original_input: str
-    arrival_deadline_seconds: Optional[int] = None
 
 
 @dataclass
-class DriverRoute:
+class AuditorStop:
+    label: str
+    facility: Location
+    arrival_deadline_seconds: int
+    pickup_earliest_seconds: int
+    pickup_latest_seconds: int
+
+
+@dataclass
+class DailyDriverRoute:
     driver_number: int
-    stops: List[Location]
-    travel_seconds: int
-    travel_meters: int
-    google_maps_url: str
-    latest_start_seconds: Optional[int] = None
-    finish_deadline_seconds: Optional[int] = None
-    stop_arrival_seconds: Optional[List[int]] = None
+    auditors: List[AuditorStop]
+    morning_order: List[AuditorStop]
+    pickup_order: List[AuditorStop]
+    morning_drop_times: Dict[str, int]
+    pickup_times: Dict[str, int]
+    latest_morning_start_seconds: Optional[int]
+    return_depot_seconds: Optional[int]
+    total_driving_seconds: int
+    total_distance_meters: int
+    morning_google_url: str
+    pickup_google_url: str
 
 
 # -----------------------------------------------------------------------------
@@ -44,7 +56,6 @@ class DriverRoute:
 # -----------------------------------------------------------------------------
 
 def get_secret_or_env(name: str, default: str = "") -> str:
-    """Read a Streamlit secret first, then an environment variable, then a default."""
     try:
         value = st.secrets.get(name)  # type: ignore[attr-defined]
         if value is not None:
@@ -83,6 +94,15 @@ APP_USER_AGENT = get_secret_or_env(
 )
 GEOCODE_DELAY_SECONDS = float_setting("GEOCODE_DELAY_SECONDS", 1.05)
 MAX_OSRM_LOCATIONS = int_setting("MAX_OSRM_LOCATIONS", 80)
+APP_STATE_VERSION = "2026-07-02-v4-auditor-round-trip"
+
+
+def reset_stale_session_state() -> None:
+    if st.session_state.get("_route_optimizer_state_version") == APP_STATE_VERSION:
+        return
+    for key in ("routes", "totals"):
+        st.session_state.pop(key, None)
+    st.session_state["_route_optimizer_state_version"] = APP_STATE_VERSION
 
 
 # -----------------------------------------------------------------------------
@@ -135,7 +155,6 @@ def require_password_if_configured() -> None:
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def expand_short_url_cached(url: str, user_agent: str) -> str:
-    """Try to follow Google Maps short links to the full URL."""
     try:
         response = requests.get(
             url,
@@ -153,26 +172,22 @@ def expand_short_url(url: str) -> str:
 
 
 def extract_lat_lng_from_text(text: str) -> Optional[Tuple[float, float]]:
-    """Extract coordinates from raw coordinates or common Google Maps URL formats."""
     text = text.strip()
 
-    # Raw coordinates, e.g. 24.4539,54.3773
     raw_match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", text)
     if raw_match:
         return float(raw_match.group(1)), float(raw_match.group(2))
 
-    # Google Maps place URLs often include !3dLAT!4dLNG for the actual selected place.
-    # Prefer this over @LAT,LNG because @ can be just the camera / viewport center.
+    # Google Maps place URLs usually store the selected place in !3dLAT!4dLNG.
+    # Prefer this over @LAT,LNG because @ can be only the camera/viewport center.
     bang_match = re.search(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)", text)
     if bang_match:
         return float(bang_match.group(1)), float(bang_match.group(2))
 
-    # Google Maps /@lat,lng,zoom format
     at_match = re.search(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", text)
     if at_match:
         return float(at_match.group(1)), float(at_match.group(2))
 
-    # URL query parameters like q=lat,lng, query=lat,lng, destination=lat,lng
     parsed = urlparse(text)
     query = parse_qs(parsed.query)
     for key in ("q", "query", "destination", "origin", "ll"):
@@ -186,11 +201,9 @@ def extract_lat_lng_from_text(text: str) -> Optional[Tuple[float, float]]:
 
 
 def extract_address_from_google_url(url: str) -> Optional[str]:
-    """Pull a readable place/address candidate from a Google Maps URL when coords are absent."""
     parsed = urlparse(url)
     path = unquote(parsed.path or "")
 
-    # /maps/place/Some+Place/...
     match = re.search(r"/place/([^/]+)", path)
     if match:
         candidate = match.group(1).replace("+", " ").strip()
@@ -210,7 +223,6 @@ def extract_address_from_google_url(url: str) -> Optional[str]:
 
 @st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
 def geocode_address_cached(address: str, nominatim_url: str, user_agent: str) -> Tuple[float, float, str]:
-    """Free geocoding through OpenStreetMap Nominatim."""
     response = requests.get(
         nominatim_url,
         params={"q": address, "format": "jsonv2", "limit": 1},
@@ -222,8 +234,7 @@ def geocode_address_cached(address: str, nominatim_url: str, user_agent: str) ->
 
     if not data:
         raise ValueError(
-            f"Could not geocode '{address}' using free OpenStreetMap/Nominatim. "
-            "Try pasting coordinates instead."
+            f"Could not geocode '{address}' using free OpenStreetMap/Nominatim. Try pasting coordinates instead."
         )
 
     result = data[0]
@@ -233,11 +244,9 @@ def geocode_address_cached(address: str, nominatim_url: str, user_agent: str) ->
 
 _last_uncached_geocode_at = 0.0
 
-def geocode_address(address: str) -> Tuple[float, float, str]:
-    """Rate-limit uncached geocoding requests."""
-    global _last_uncached_geocode_at
 
-    # If cached, Streamlit returns immediately. If not cached, keep Nominatim-friendly delay.
+def geocode_address(address: str) -> Tuple[float, float, str]:
+    global _last_uncached_geocode_at
     elapsed = time.monotonic() - _last_uncached_geocode_at
     if elapsed < GEOCODE_DELAY_SECONDS:
         time.sleep(GEOCODE_DELAY_SECONDS - elapsed)
@@ -247,8 +256,8 @@ def geocode_address(address: str) -> Tuple[float, float, str]:
     return value
 
 
-def parse_location(line: str, index: int, label_prefix: str = "Stop") -> Location:
-    original = line.strip()
+def parse_location(value: str, index: int, label_prefix: str = "Stop") -> Location:
+    original = value.strip()
     if not original:
         raise ValueError("Empty location line")
 
@@ -291,7 +300,6 @@ def haversine_meters(a: Location, b: Location) -> int:
 
 
 def build_haversine_matrix(locations: List[Location]) -> Tuple[List[List[int]], List[List[int]]]:
-    """Straight-line fallback: estimated at 35 km/h average speed."""
     n = len(locations)
     time_matrix = [[0 for _ in range(n)] for _ in range(n)]
     distance_matrix = [[0 for _ in range(n)] for _ in range(n)]
@@ -317,8 +325,8 @@ def compute_osrm_route_matrix_cached(
 ) -> Tuple[List[List[int]], List[List[int]]]:
     if len(coords) > max_osrm_locations:
         raise ValueError(
-            f"Too many locations for the public OSRM server ({len(coords)} > {max_osrm_locations}). "
-            "Use fewer stops, set ROUTING_PROVIDER=haversine, or self-host OSRM."
+            f"Too many unique locations for the public OSRM server ({len(coords)} > {max_osrm_locations}). "
+            "Use fewer auditors, set ROUTING_PROVIDER=haversine, or self-host OSRM."
         )
 
     coord_string = ";".join(f"{lng:.7f},{lat:.7f}" for lat, lng in coords)
@@ -377,221 +385,35 @@ def compute_route_matrix(locations: List[Location]) -> Tuple[List[List[int]], Li
     raise ValueError("Invalid ROUTING_PROVIDER. Use 'osrm' or 'haversine'.")
 
 
-def make_virtual_depot_matrix(
-    stop_locations: List[Location],
-    stop_time_matrix: List[List[int]],
-    stop_distance_matrix: List[List[int]],
-) -> Tuple[List[Location], List[List[int]], List[List[int]]]:
-    """Add a zero-cost virtual depot when the user does not provide a real start/end point."""
-    virtual_depot = Location(label="Virtual depot", lat=0, lng=0, original_input="")
-    locations = [virtual_depot] + stop_locations
-    n = len(locations)
-    time_matrix = [[0 for _ in range(n)] for _ in range(n)]
-    distance_matrix = [[0 for _ in range(n)] for _ in range(n)]
+def expand_facility_matrix_for_drop_pickup(
+    base_time_matrix: List[List[int]],
+    base_distance_matrix: List[List[int]],
+    stop_count: int,
+) -> Tuple[List[List[int]], List[List[int]], List[int]]:
+    """Expand depot+facilities matrix into depot+drop nodes+pickup nodes.
 
-    for i in range(1, n):
-        for j in range(1, n):
-            time_matrix[i][j] = stop_time_matrix[i - 1][j - 1]
-            distance_matrix[i][j] = stop_distance_matrix[i - 1][j - 1]
+    Node 0 is depot.
+    Nodes 1..N are morning drop-off nodes.
+    Nodes N+1..2N are afternoon pickup nodes at the same facility coordinates.
+    """
+    base_index_by_node = [0] + list(range(1, stop_count + 1)) + list(range(1, stop_count + 1))
+    total_nodes = 1 + 2 * stop_count
+    time_matrix = [[0 for _ in range(total_nodes)] for _ in range(total_nodes)]
+    distance_matrix = [[0 for _ in range(total_nodes)] for _ in range(total_nodes)]
 
-    return locations, time_matrix, distance_matrix
+    for i in range(total_nodes):
+        for j in range(total_nodes):
+            bi = base_index_by_node[i]
+            bj = base_index_by_node[j]
+            time_matrix[i][j] = base_time_matrix[bi][bj]
+            distance_matrix[i][j] = base_distance_matrix[bi][bj]
 
-
-# -----------------------------------------------------------------------------
-# Optimization
-# -----------------------------------------------------------------------------
-
-def solve_vrp(
-    locations: List[Location],
-    time_matrix: List[List[int]],
-    distance_matrix: List[List[int]],
-    driver_count: int,
-    return_to_depot: bool,
-    use_virtual_depot: bool,
-    finish_deadline_seconds: Optional[int] = None,
-    require_all_drivers_if_possible: bool = True,
-) -> List[DriverRoute]:
-    if driver_count < 1:
-        raise ValueError("Driver count must be at least 1.")
-    if len(locations) <= 1:
-        raise ValueError("Add at least one stop.")
-
-    depot_index = 0
-
-    # If drivers do not return to the depot, the final leg back to depot is cost 0.
-    # This creates open routes: office -> stops -> final stop.
-    effective_time_matrix = [row[:] for row in time_matrix]
-    effective_distance_matrix = [row[:] for row in distance_matrix]
-    if not return_to_depot or use_virtual_depot:
-        for i in range(len(locations)):
-            if i != depot_index:
-                effective_time_matrix[i][depot_index] = 0
-                effective_distance_matrix[i][depot_index] = 0
-
-    manager = pywrapcp.RoutingIndexManager(len(locations), driver_count, depot_index)
-    routing = pywrapcp.RoutingModel(manager)
-
-    def time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return int(effective_time_matrix[from_node][to_node])
-
-    transit_callback_index = routing.RegisterTransitCallback(time_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-    horizon_seconds = max(1, sum(max(row) for row in effective_time_matrix) * 2)
-    routing.AddDimension(transit_callback_index, 0, horizon_seconds, True, "Time")
-    time_dimension = routing.GetDimensionOrDie("Time")
-
-    # Main objective: finish the whole job as early as possible.
-    # This minimizes the longest driver's route, not equal stop counts.
-    # Arc cost remains as a smaller tie-breaker against unnecessary driving.
-    time_dimension.SetGlobalSpanCostCoefficient(1_000_000)
-
-    # For this use case, an unused driver can cause auditors to wait unnecessarily
-    # while another driver handles multiple far-away stops. If there are at least
-    # as many stops as drivers, force every driver to get at least one stop.
-    if require_all_drivers_if_possible:
-        vehicles_to_force = min(driver_count, len(locations) - 1)
-        solver = routing.solver()
-        for vehicle_id in range(vehicles_to_force):
-            solver.Add(routing.NextVar(routing.Start(vehicle_id)) != routing.End(vehicle_id))
-
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.seconds = 25
-
-    solution = routing.SolveWithParameters(search_parameters)
-    if not solution:
-        raise ValueError("No route solution found. Try fewer drivers, fewer stops, or check unreachable locations.")
-
-    driver_routes: List[DriverRoute] = []
-    for vehicle_id in range(driver_count):
-        index = routing.Start(vehicle_id)
-        route_nodes = []
-        arrival_offsets = []
-        route_seconds = 0
-        route_meters = 0
-        previous_node = None
-
-        while not routing.IsEnd(index):
-            node = manager.IndexToNode(index)
-            if previous_node is not None:
-                route_seconds += effective_time_matrix[previous_node][node]
-                route_meters += effective_distance_matrix[previous_node][node]
-            if node != depot_index:
-                route_nodes.append(node)
-                arrival_offsets.append(route_seconds)
-            previous_node = node
-            index = solution.Value(routing.NextVar(index))
-
-        end_node = manager.IndexToNode(index)
-        if previous_node is not None:
-            route_seconds += effective_time_matrix[previous_node][end_node]
-            route_meters += effective_distance_matrix[previous_node][end_node]
-
-        stops = [locations[node] for node in route_nodes]
-        maps_url = build_google_maps_directions_url(stops, locations[0], return_to_depot, use_virtual_depot)
-
-        latest_start_seconds = None
-        stop_arrival_seconds = None
-        if route_nodes:
-            latest_start_candidates: List[int] = []
-            for node, offset in zip(route_nodes, arrival_offsets):
-                stop_deadline = locations[node].arrival_deadline_seconds
-                if stop_deadline is None:
-                    stop_deadline = finish_deadline_seconds
-                if stop_deadline is not None:
-                    latest_start_candidates.append(stop_deadline - offset)
-
-            if latest_start_candidates:
-                # Start as late as possible while still reaching every assigned auditor/facility
-                # by that stop's own arrival time.
-                latest_start_seconds = min(latest_start_candidates)
-                stop_arrival_seconds = [latest_start_seconds + offset for offset in arrival_offsets]
-        elif finish_deadline_seconds is not None:
-            latest_start_seconds = finish_deadline_seconds
-            stop_arrival_seconds = []
-
-        driver_routes.append(
-            DriverRoute(
-                driver_number=vehicle_id + 1,
-                stops=stops,
-                travel_seconds=route_seconds,
-                travel_meters=route_meters,
-                google_maps_url=maps_url,
-                latest_start_seconds=latest_start_seconds,
-                finish_deadline_seconds=finish_deadline_seconds,
-                stop_arrival_seconds=stop_arrival_seconds,
-            )
-        )
-
-    return driver_routes
+    return time_matrix, distance_matrix, base_index_by_node
 
 
 # -----------------------------------------------------------------------------
 # Formatting and links
 # -----------------------------------------------------------------------------
-
-def build_google_maps_directions_url(
-    stops: List[Location], depot: Location, return_to_depot: bool, use_virtual_depot: bool
-) -> str:
-    if not stops:
-        return ""
-
-    def coord(loc: Location) -> str:
-        return f"{loc.lat},{loc.lng}"
-
-    if use_virtual_depot:
-        origin = coord(stops[0])
-        destination = coord(stops[-1])
-        waypoints = [coord(stop) for stop in stops[1:-1]]
-    else:
-        origin = coord(depot)
-        if return_to_depot:
-            destination = coord(depot)
-            waypoints = [coord(stop) for stop in stops]
-        else:
-            destination = coord(stops[-1])
-            waypoints = [coord(stop) for stop in stops[:-1]]
-
-    url = (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&origin={quote_plus(origin)}"
-        f"&destination={quote_plus(destination)}"
-        "&travelmode=driving"
-    )
-    if waypoints:
-        url += "&waypoints=" + quote_plus("|".join(waypoints))
-    return url
-
-
-def format_duration(seconds: int) -> str:
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
-
-def format_distance(meters: int) -> str:
-    if meters >= 1000:
-        return f"{meters / 1000:.1f} km"
-    return f"{meters} m"
-
-
-def parse_time_of_day(value: str) -> int:
-    value = (value or "09:00").strip()
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
-    if not match:
-        raise ValueError("Time must be in HH:MM format, for example 09:00.")
-    hours = int(match.group(1))
-    minutes = int(match.group(2))
-    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
-        raise ValueError("Time must be a valid time of day.")
-    return hours * 3600 + minutes * 60
-
 
 def seconds_from_time(value: datetime.time) -> int:
     return value.hour * 3600 + value.minute * 60
@@ -616,137 +438,260 @@ def format_clock(seconds: Optional[int]) -> str:
     return f"{hours:02d}:{minutes:02d}{suffix}"
 
 
-# -----------------------------------------------------------------------------
-# Streamlit UI
-# -----------------------------------------------------------------------------
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
-def optimize_routes(
-    stop_rows: List[Tuple[str, int]],
-    depot_input: str,
+def format_distance(meters: int) -> str:
+    if meters >= 1000:
+        return f"{meters / 1000:.1f} km"
+    return f"{meters} m"
+
+
+def build_google_maps_directions_url(points: List[Location]) -> str:
+    if len(points) < 2:
+        return ""
+
+    def coord(loc: Location) -> str:
+        return f"{loc.lat},{loc.lng}"
+
+    origin = coord(points[0])
+    destination = coord(points[-1])
+    waypoints = [coord(point) for point in points[1:-1]]
+    url = (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={quote_plus(origin)}"
+        f"&destination={quote_plus(destination)}"
+        "&travelmode=driving"
+    )
+    if waypoints:
+        url += "&waypoints=" + quote_plus("|".join(waypoints))
+    return url
+
+
+# -----------------------------------------------------------------------------
+# Optimization
+# -----------------------------------------------------------------------------
+
+def solve_daily_auditor_routes(
+    depot: Location,
+    auditors: List[AuditorStop],
     driver_count: int,
-    return_to_depot: bool,
-    require_all_drivers_if_possible: bool,
-    default_arrival_deadline_seconds: int,
-) -> Tuple[List[DriverRoute], Dict[str, Optional[int]]]:
-    cleaned_rows = [(raw.strip(), deadline) for raw, deadline in stop_rows if raw.strip()]
-    if not cleaned_rows:
-        raise ValueError("Add at least one Google Maps link, coordinate, or address.")
+    require_all_drivers_if_possible: bool = True,
+    solver_seconds: int = 30,
+) -> Tuple[List[DailyDriverRoute], Dict[str, Optional[int]]]:
+    if driver_count < 1:
+        raise ValueError("Driver count must be at least 1.")
+    if not auditors:
+        raise ValueError("Add at least one auditor/facility.")
 
-    stop_locations: List[Location] = []
-    for idx, (raw, deadline_seconds) in enumerate(cleaned_rows, start=1):
-        loc = parse_location(raw, idx)
-        loc.arrival_deadline_seconds = deadline_seconds
-        stop_locations.append(loc)
-
-    if depot_input.strip():
-        depot = parse_location(depot_input.strip(), 0, label_prefix="Depot")
-        all_locations = [depot] + stop_locations
-        time_matrix, distance_matrix = compute_route_matrix(all_locations)
-        use_virtual_depot = False
-    else:
-        stop_time_matrix, stop_distance_matrix = compute_route_matrix(stop_locations)
-        all_locations, time_matrix, distance_matrix = make_virtual_depot_matrix(
-            stop_locations, stop_time_matrix, stop_distance_matrix
-        )
-        use_virtual_depot = True
-        return_to_depot = False
-
-    routes = solve_vrp(
-        all_locations,
-        time_matrix,
-        distance_matrix,
-        driver_count,
-        return_to_depot,
-        use_virtual_depot,
-        default_arrival_deadline_seconds,
-        require_all_drivers_if_possible=require_all_drivers_if_possible,
+    # Build one OSRM matrix for unique physical points only, then duplicate each facility
+    # into a morning drop-off node and an afternoon pickup node.
+    physical_locations = [depot] + [auditor.facility for auditor in auditors]
+    base_time_matrix, base_distance_matrix = compute_route_matrix(physical_locations)
+    time_matrix, distance_matrix, _ = expand_facility_matrix_for_drop_pickup(
+        base_time_matrix, base_distance_matrix, len(auditors)
     )
 
-    used_routes = [route for route in routes if route.stops]
-    longest_route_seconds = max((route.travel_seconds for route in used_routes), default=0)
-    latest_common_start_candidates = [
-        route.latest_start_seconds for route in used_routes if route.latest_start_seconds is not None
-    ]
-    latest_common_start = min(latest_common_start_candidates) if latest_common_start_candidates else None
-    earliest_deadline = min((loc.arrival_deadline_seconds or default_arrival_deadline_seconds) for loc in stop_locations)
-    latest_deadline = max((loc.arrival_deadline_seconds or default_arrival_deadline_seconds) for loc in stop_locations)
+    n = len(auditors)
+    total_nodes = 1 + 2 * n
+    depot_node = 0
+    drop_node_by_auditor = {i: 1 + i for i in range(n)}
+    pickup_node_by_auditor = {i: 1 + n + i for i in range(n)}
+    auditor_index_by_node = {1 + i: i for i in range(n)}
+    auditor_index_by_node.update({1 + n + i: i for i in range(n)})
 
+    manager = pywrapcp.RoutingIndexManager(total_nodes, driver_count, depot_node)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def time_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return int(time_matrix[from_node][to_node])
+
+    transit_callback_index = routing.RegisterTransitCallback(time_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    # Enough slack for the driver to wait between morning drop-offs and afternoon pickups.
+    horizon_seconds = 24 * 3600
+    routing.AddDimension(
+        transit_callback_index,
+        horizon_seconds,   # allow waiting
+        horizon_seconds,   # daily horizon
+        False,             # flexible start time; we compute/display latest feasible morning start
+        "Time",
+    )
+    time_dimension = routing.GetDimensionOrDie("Time")
+
+    solver = routing.solver()
+
+    # Time windows:
+    # - drop-off nodes must be reached by each auditor's audit start time
+    # - pickup nodes cannot be before the auditor can leave, and should not be after latest pickup
+    # - soft upper bound at pickup earliest makes the solver reduce "auditor waiting after work"
+    pickup_lateness_penalty_per_second = 10_000
+    for i, auditor in enumerate(auditors):
+        drop_node = drop_node_by_auditor[i]
+        pickup_node = pickup_node_by_auditor[i]
+        drop_index = manager.NodeToIndex(drop_node)
+        pickup_index = manager.NodeToIndex(pickup_node)
+
+        time_dimension.CumulVar(drop_index).SetRange(0, auditor.arrival_deadline_seconds)
+        time_dimension.CumulVar(pickup_index).SetRange(
+            auditor.pickup_earliest_seconds,
+            auditor.pickup_latest_seconds,
+        )
+        time_dimension.SetCumulVarSoftUpperBound(
+            pickup_index,
+            auditor.pickup_earliest_seconds,
+            pickup_lateness_penalty_per_second,
+        )
+
+        # Same driver must drop off and pick up the same auditor.
+        solver.Add(routing.VehicleVar(drop_index) == routing.VehicleVar(pickup_index))
+        # Pickup must happen after drop-off.
+        solver.Add(time_dimension.CumulVar(drop_index) <= time_dimension.CumulVar(pickup_index))
+
+    for vehicle_id in range(driver_count):
+        time_dimension.CumulVar(routing.Start(vehicle_id)).SetRange(0, 12 * 3600)
+        time_dimension.CumulVar(routing.End(vehicle_id)).SetRange(0, horizon_seconds)
+
+    # Encourage actual use of all drivers where it makes sense. This matters because otherwise
+    # the solver can leave one driver unused and make auditors wait for one long shared route.
+    if require_all_drivers_if_possible:
+        vehicles_to_force = min(driver_count, n)
+        for vehicle_id in range(vehicles_to_force):
+            solver.Add(routing.NextVar(routing.Start(vehicle_id)) != routing.End(vehicle_id))
+
+    # Tie-breakers: keep the day compact and reduce unnecessary driving after satisfying the
+    # pickup-waiting objective.
+    time_dimension.SetGlobalSpanCostCoefficient(10)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_parameters.time_limit.seconds = solver_seconds
+
+    solution = routing.SolveWithParameters(search_parameters)
+    if not solution:
+        raise ValueError(
+            "No feasible schedule found. Try increasing the pickup latest time, using more drivers, "
+            "or checking whether the facilities are too far apart for the selected time windows."
+        )
+
+    routes: List[DailyDriverRoute] = []
+    for vehicle_id in range(driver_count):
+        index = routing.Start(vehicle_id)
+        route_nodes: List[int] = []
+        route_seconds = 0
+        route_meters = 0
+        previous_node: Optional[int] = None
+
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if previous_node is not None:
+                route_seconds += time_matrix[previous_node][node]
+                route_meters += distance_matrix[previous_node][node]
+            if node != depot_node:
+                route_nodes.append(node)
+            previous_node = node
+            index = solution.Value(routing.NextVar(index))
+
+        end_node = manager.IndexToNode(index)
+        end_time = solution.Value(time_dimension.CumulVar(index))
+        if previous_node is not None:
+            route_seconds += time_matrix[previous_node][end_node]
+            route_meters += distance_matrix[previous_node][end_node]
+
+        morning_nodes = [node for node in route_nodes if 1 <= node <= n]
+        pickup_nodes = [node for node in route_nodes if n + 1 <= node <= 2 * n]
+        morning_order = [auditors[auditor_index_by_node[node]] for node in morning_nodes]
+        pickup_order = [auditors[auditor_index_by_node[node]] for node in pickup_nodes]
+        assigned_indices = sorted({auditor_index_by_node[node] for node in route_nodes})
+        assigned_auditors = [auditors[i] for i in assigned_indices]
+
+        # Compute latest possible morning start from depot while still meeting every drop-off deadline.
+        latest_start: Optional[int] = None
+        morning_drop_times: Dict[str, int] = {}
+        if morning_nodes:
+            offsets: List[Tuple[int, int]] = []
+            elapsed = 0
+            prev = depot_node
+            for node in morning_nodes:
+                elapsed += time_matrix[prev][node]
+                offsets.append((node, elapsed))
+                prev = node
+            latest_start = min(
+                auditors[auditor_index_by_node[node]].arrival_deadline_seconds - offset
+                for node, offset in offsets
+            )
+            for node, offset in offsets:
+                auditor = auditors[auditor_index_by_node[node]]
+                morning_drop_times[auditor.label] = latest_start + offset
+
+        pickup_times: Dict[str, int] = {}
+        for node in pickup_nodes:
+            auditor = auditors[auditor_index_by_node[node]]
+            node_index = manager.NodeToIndex(node)
+            pickup_times[auditor.label] = solution.Value(time_dimension.CumulVar(node_index))
+
+        morning_points = [depot] + [auditor.facility for auditor in morning_order]
+        pickup_points = [auditor.facility for auditor in pickup_order] + [depot]
+        morning_url = build_google_maps_directions_url(morning_points) if len(morning_points) >= 2 else ""
+        pickup_url = build_google_maps_directions_url(pickup_points) if len(pickup_points) >= 2 else ""
+
+        routes.append(
+            DailyDriverRoute(
+                driver_number=vehicle_id + 1,
+                auditors=assigned_auditors,
+                morning_order=morning_order,
+                pickup_order=pickup_order,
+                morning_drop_times=morning_drop_times,
+                pickup_times=pickup_times,
+                latest_morning_start_seconds=latest_start,
+                return_depot_seconds=end_time if assigned_auditors else None,
+                total_driving_seconds=route_seconds if assigned_auditors else 0,
+                total_distance_meters=route_meters if assigned_auditors else 0,
+                morning_google_url=morning_url,
+                pickup_google_url=pickup_url,
+            )
+        )
+
+    used_routes = [route for route in routes if route.auditors]
+    pickup_waits = []
+    for route in used_routes:
+        for auditor in route.pickup_order:
+            pickup_time = route.pickup_times.get(auditor.label)
+            if pickup_time is not None:
+                pickup_waits.append(max(0, pickup_time - auditor.pickup_earliest_seconds))
+
+    latest_common_start_candidates = [
+        route.latest_morning_start_seconds for route in used_routes if route.latest_morning_start_seconds is not None
+    ]
     totals: Dict[str, Optional[int]] = {
-        "time": sum(route.travel_seconds for route in used_routes),
-        "distance": sum(route.travel_meters for route in used_routes),
-        "stops": sum(len(route.stops) for route in used_routes),
+        "auditors": len(auditors),
         "drivers_used": len(used_routes),
         "driver_count": driver_count,
-        "longest_route": longest_route_seconds,
-        "latest_common_start": latest_common_start,
-        "earliest_deadline": earliest_deadline,
-        "latest_deadline": latest_deadline,
+        "total_driving_time": sum(route.total_driving_seconds for route in used_routes),
+        "total_distance": sum(route.total_distance_meters for route in used_routes),
+        "latest_common_start": min(latest_common_start_candidates) if latest_common_start_candidates else None,
+        "latest_return": max((route.return_depot_seconds for route in used_routes if route.return_depot_seconds is not None), default=None),
+        "max_pickup_wait": max(pickup_waits, default=0),
+        "total_pickup_wait": sum(pickup_waits),
     }
     return routes, totals
 
 
-def render_results(routes: List[DriverRoute], totals: Dict[str, Optional[int]]) -> None:
-    st.subheader("Summary")
-    cols = st.columns(7)
-    cols[0].metric("Total stops", totals.get("stops") or 0)
-    cols[1].metric("Drivers used", f"{totals.get('drivers_used') or 0}/{totals.get('driver_count') or 0}")
-    cols[2].metric("Longest driver route", format_duration(int(totals.get("longest_route") or 0)))
-    cols[3].metric("Latest common start", format_clock(totals.get("latest_common_start")))
-    cols[4].metric(
-        "Arrival window",
-        f"{format_clock(totals.get('earliest_deadline'))}–{format_clock(totals.get('latest_deadline'))}",
-    )
-    cols[5].metric("Total driving time", format_duration(int(totals.get("time") or 0)))
-    cols[6].metric("Total distance", format_distance(int(totals.get("distance") or 0)))
+# -----------------------------------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------------------------------
 
-    warnings = []
-    for route in routes:
-        if route.stops and route.latest_start_seconds is not None and route.latest_start_seconds < 0:
-            warnings.append(f"Driver {route.driver_number} would need to start before midnight to satisfy all arrival times.")
-    if warnings:
-        st.warning(" ".join(warnings))
-
-    st.subheader("Driver routes")
-    for route in routes:
-        with st.container(border=True):
-            left, right = st.columns([2, 1])
-            with left:
-                st.markdown(f"### Driver {route.driver_number}")
-                st.write(
-                    f"{len(route.stops)} stops · {format_duration(route.travel_seconds)} · "
-                    f"{format_distance(route.travel_meters)}"
-                )
-                if route.latest_start_seconds is not None and route.stops:
-                    st.write(f"Start at latest: **{format_clock(route.latest_start_seconds)}**")
-            with right:
-                if route.google_maps_url:
-                    st.link_button("Open route in Google Maps", route.google_maps_url, use_container_width=True)
-
-            if not route.stops:
-                st.caption("No stops assigned. This should only happen when there are more drivers than stops, or when 'force all drivers' is off.")
-                continue
-
-            rows = []
-            for idx, stop in enumerate(route.stops, start=1):
-                eta = ""
-                if route.stop_arrival_seconds:
-                    eta = format_clock(route.stop_arrival_seconds[idx - 1])
-                deadline = stop.arrival_deadline_seconds
-                rows.append(
-                    {
-                        "#": idx,
-                        "Stop": stop.label,
-                        "Arrive by": format_clock(deadline),
-                        "ETA if leaving at latest start": eta,
-                        "Coordinates": f"{stop.lat:.6f}, {stop.lng:.6f}",
-                        "Original input": stop.original_input,
-                    }
-                )
-            st.dataframe(rows, hide_index=True, use_container_width=True)
-
-
-def _default_stop_values() -> List[str]:
+def default_stop_values() -> List[str]:
     return [
         "25.221375, 55.285106",
         "24.782154, 54.738854",
@@ -759,113 +704,230 @@ def _default_stop_values() -> List[str]:
     ]
 
 
-def main() -> None:
-    st.set_page_config(page_title="Multi-Driver Route Optimizer", page_icon="🚗", layout="wide")
-    require_password_if_configured()
+def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[int]]) -> None:
+    st.subheader("Summary")
+    cols = st.columns(7)
+    cols[0].metric("Auditors", totals.get("auditors") or 0)
+    cols[1].metric("Drivers used", f"{totals.get('drivers_used') or 0}/{totals.get('driver_count') or 0}")
+    cols[2].metric("Latest common morning start", format_clock(totals.get("latest_common_start")))
+    cols[3].metric("Latest depot return", format_clock(totals.get("latest_return")))
+    cols[4].metric("Max pickup wait", format_duration(int(totals.get("max_pickup_wait") or 0)))
+    cols[5].metric("Total driving", format_duration(int(totals.get("total_driving_time") or 0)))
+    cols[6].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
 
-    st.title("Multi-Driver Route Optimizer")
+    warnings = []
+    for route in routes:
+        if route.auditors and route.latest_morning_start_seconds is not None and route.latest_morning_start_seconds < 0:
+            warnings.append(f"Driver {route.driver_number} would need to start before midnight to meet the morning arrival deadlines.")
+        for auditor in route.pickup_order:
+            pickup_time = route.pickup_times.get(auditor.label)
+            if pickup_time is not None and pickup_time > auditor.pickup_latest_seconds:
+                warnings.append(f"{auditor.label} is picked up after the allowed latest pickup time.")
+    if warnings:
+        st.warning(" ".join(warnings))
+
+    st.subheader("Driver daily routes")
+    for route in routes:
+        with st.container(border=True):
+            st.markdown(f"### Driver {route.driver_number}")
+            st.write(
+                f"{len(route.auditors)} auditor(s) · {format_duration(route.total_driving_seconds)} driving · "
+                f"{format_distance(route.total_distance_meters)}"
+            )
+            if route.auditors:
+                st.write(
+                    f"Morning start at latest: **{format_clock(route.latest_morning_start_seconds)}** · "
+                    f"Return to depot around: **{format_clock(route.return_depot_seconds)}**"
+                )
+            else:
+                st.caption("No auditors assigned. This should only happen if there are more drivers than auditors, or if force-all-drivers is off.")
+                continue
+
+            link_cols = st.columns(2)
+            if route.morning_google_url:
+                link_cols[0].link_button("Open morning drop-off route", route.morning_google_url, use_container_width=True)
+            if route.pickup_google_url:
+                link_cols[1].link_button("Open afternoon pickup route", route.pickup_google_url, use_container_width=True)
+
+            st.markdown("**Morning drop-off sequence**")
+            morning_rows = []
+            for idx, auditor in enumerate(route.morning_order, start=1):
+                morning_rows.append(
+                    {
+                        "#": idx,
+                        "Auditor/facility": auditor.label,
+                        "Arrive by": format_clock(auditor.arrival_deadline_seconds),
+                        "ETA if leaving at latest start": format_clock(route.morning_drop_times.get(auditor.label)),
+                        "Coordinates": f"{auditor.facility.lat:.6f}, {auditor.facility.lng:.6f}",
+                        "Original input": auditor.facility.original_input,
+                    }
+                )
+            st.dataframe(morning_rows, hide_index=True, use_container_width=True)
+
+            st.markdown("**Afternoon pickup sequence**")
+            pickup_rows = []
+            for idx, auditor in enumerate(route.pickup_order, start=1):
+                pickup_time = route.pickup_times.get(auditor.label)
+                wait_seconds = max(0, (pickup_time or 0) - auditor.pickup_earliest_seconds) if pickup_time is not None else 0
+                pickup_rows.append(
+                    {
+                        "#": idx,
+                        "Auditor/facility": auditor.label,
+                        "Can leave from": format_clock(auditor.pickup_earliest_seconds),
+                        "Latest pickup": format_clock(auditor.pickup_latest_seconds),
+                        "Planned pickup": format_clock(pickup_time),
+                        "Wait after leave time": format_duration(wait_seconds),
+                        "Coordinates": f"{auditor.facility.lat:.6f}, {auditor.facility.lng:.6f}",
+                    }
+                )
+            st.dataframe(pickup_rows, hide_index=True, use_container_width=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Multi-Driver Auditor Route Optimizer", page_icon="🚗", layout="wide")
+    require_password_if_configured()
+    reset_stale_session_state()
+
+    st.title("Multi-Driver Auditor Route Optimizer")
     st.caption(
-        "Plan auditor drop-offs/pickups with multiple drivers. Each stop can have its own required arrival time. "
-        "No paid Google API key is required."
+        "Same driver drops off and picks up the same auditor. The route starts at the depot in the morning, "
+        "drops auditors at facilities, picks those same auditors up after work, then returns to the depot at end of day."
     )
 
     with st.sidebar:
         st.header("Settings")
         st.write(f"Routing provider: **{ROUTING_PROVIDER}**")
         if ROUTING_PROVIDER == "osrm":
-            st.caption("Using OSRM/OpenStreetMap road travel times. No live traffic.")
+            st.caption("Using OSRM/OpenStreetMap road travel times. No live traffic and no paid Google API key.")
         else:
             st.caption("Using straight-line estimates only.")
         st.divider()
-        st.caption("For morning drop-offs: arrival time means the auditor must reach the facility by that time.")
-        st.caption("For afternoon pickup planning: use the facility as the stop and set the arrival time to the latest pickup time, e.g. 17:00.")
+        st.caption("Morning arrival = when the auditor must reach the facility.")
+        st.caption("Pickup earliest = when the auditor can leave work, usually 16:00.")
+        st.caption("Pickup latest = latest acceptable pickup, usually 17:00.")
 
-    defaults = _default_stop_values()
+    defaults = default_stop_values()
 
-    st.markdown("### Trip setup")
-    trip_mode = st.radio(
-        "Trip type",
-        ["Morning drop-off", "Afternoon pickup / return"],
-        horizontal=True,
-        help="The optimizer is the same, but this changes the default return-to-depot behavior and labels.",
-    )
-
-    c_top1, c_top2, c_top3, c_top4 = st.columns([1, 1, 1, 2])
-    with c_top1:
-        stop_count = st.number_input("Number of stops", min_value=1, max_value=40, value=7, step=1)
-    with c_top2:
+    st.markdown("### Daily setup")
+    top_cols = st.columns([1, 1, 1, 1, 2])
+    with top_cols[0]:
+        auditor_count = st.number_input("Number of auditors/facilities", min_value=1, max_value=39, value=7, step=1)
+    with top_cols[1]:
         driver_count = st.number_input("Number of drivers", min_value=1, max_value=20, value=4, step=1)
-    with c_top3:
-        default_time = st.time_input("Default arrival time", value=datetime.time(9, 0))
-    with c_top4:
+    with top_cols[2]:
+        default_arrival_time = st.time_input("Default arrive by", value=datetime.time(9, 0))
+    with top_cols[3]:
+        default_pickup_earliest = st.time_input("Default can leave", value=datetime.time(16, 0))
+    with top_cols[4]:
         depot_input = st.text_input(
-            "Depot / office / starting point",
+            "Depot / office",
             value=st.session_state.get("depot_input", "24.485451, 54.381805"),
             placeholder="Office address, coordinates, or Google Maps link",
         )
 
-    default_return_to_depot = trip_mode == "Afternoon pickup / return"
-    c_opts1, c_opts2 = st.columns([1, 2])
-    with c_opts1:
-        return_to_depot = st.checkbox(
-            "Include return to depot in route cost",
-            value=default_return_to_depot,
-            help="For morning drop-offs this is usually off. For afternoon pickups/returns this is usually on.",
-        )
-    with c_opts2:
-        require_all_drivers_if_possible = st.checkbox(
-            "Use all available drivers when possible",
+    second_cols = st.columns([1, 1, 2])
+    with second_cols[0]:
+        default_pickup_latest = st.time_input("Default latest pickup", value=datetime.time(17, 0))
+    with second_cols[1]:
+        require_all_drivers = st.checkbox(
+            "Use all drivers when possible",
             value=True,
-            help="If there are at least as many stops as drivers, every driver will get at least one stop.",
+            help="If auditors >= drivers, every driver is forced to handle at least one auditor.",
+        )
+    with second_cols[2]:
+        st.info(
+            "The optimizer prioritizes reducing pickup delay after work. A driver will only carry multiple auditors "
+            "when the same-driver morning + afternoon plan still fits the time windows."
         )
 
-    st.markdown("### Stops")
-    st.caption("One Google Maps link / address / coordinate per row. If you leave arrival time unchanged, it defaults to the time above.")
+    st.markdown("### Auditors / facilities")
+    st.caption("Each row is one auditor's facility. The same driver that drops this auditor off will pick them up again.")
 
-    stop_rows: List[Tuple[str, int]] = []
-    with st.form("route_form"):
-        header = st.columns([0.4, 4, 1.2])
+    stop_rows: List[Tuple[str, int, int, int]] = []
+    with st.form("daily_route_form"):
+        header = st.columns([0.3, 3.4, 1, 1, 1])
         header[0].markdown("**#**")
-        header[1].markdown("**Google Maps link / coordinates / address**")
+        header[1].markdown("**Facility Google Maps link / coordinates / address**")
         header[2].markdown("**Arrive by**")
+        header[3].markdown("**Can leave**")
+        header[4].markdown("**Latest pickup**")
 
-        default_arrival_seconds = seconds_from_time(default_time)
-        for idx in range(1, int(stop_count) + 1):
-            row = st.columns([0.4, 4, 1.2])
+        for idx in range(1, int(auditor_count) + 1):
+            row = st.columns([0.3, 3.4, 1, 1, 1])
             row[0].write(idx)
             default_value = defaults[idx - 1] if idx <= len(defaults) else ""
             raw = row[1].text_input(
-                f"Stop {idx}",
+                f"Facility {idx}",
                 value=default_value,
                 label_visibility="collapsed",
                 placeholder="https://maps.app.goo.gl/... or 24.4539,54.3773",
-                key=f"stop_input_{idx}",
+                key=f"facility_input_{idx}",
             )
             arrival_time = row[2].time_input(
-                f"Arrival time {idx}",
-                value=default_time,
+                f"Arrive by {idx}",
+                value=default_arrival_time,
                 label_visibility="collapsed",
                 key=f"arrival_time_{idx}",
             )
-            stop_rows.append((raw, seconds_from_time(arrival_time)))
+            pickup_earliest = row[3].time_input(
+                f"Can leave {idx}",
+                value=default_pickup_earliest,
+                label_visibility="collapsed",
+                key=f"pickup_earliest_{idx}",
+            )
+            pickup_latest = row[4].time_input(
+                f"Latest pickup {idx}",
+                value=default_pickup_latest,
+                label_visibility="collapsed",
+                key=f"pickup_latest_{idx}",
+            )
+            stop_rows.append(
+                (
+                    raw,
+                    seconds_from_time(arrival_time),
+                    seconds_from_time(pickup_earliest),
+                    seconds_from_time(pickup_latest),
+                )
+            )
 
-        submitted = st.form_submit_button("Optimize routes", type="primary")
+        submitted = st.form_submit_button("Optimize full-day routes", type="primary")
 
     if submitted:
         st.session_state["depot_input"] = depot_input
         try:
-            with st.spinner("Parsing locations, fetching route matrix, and optimizing routes..."):
-                routes, totals = optimize_routes(
-                    stop_rows=stop_rows,
-                    depot_input=depot_input,
+            cleaned_rows = [row for row in stop_rows if row[0].strip()]
+            if not cleaned_rows:
+                raise ValueError("Add at least one facility link, coordinate, or address.")
+            if not depot_input.strip():
+                raise ValueError("Depot / office is required for the full-day route model.")
+
+            with st.spinner("Parsing locations, fetching route matrix, and optimizing full-day routes..."):
+                depot = parse_location(depot_input.strip(), 0, label_prefix="Depot")
+                auditors: List[AuditorStop] = []
+                for idx, (raw, arrive_by, pickup_earliest, pickup_latest) in enumerate(cleaned_rows, start=1):
+                    if pickup_latest < pickup_earliest:
+                        raise ValueError(f"Row {idx}: latest pickup cannot be earlier than can-leave time.")
+                    facility = parse_location(raw, idx, label_prefix="Facility")
+                    auditors.append(
+                        AuditorStop(
+                            label=f"Auditor {idx}",
+                            facility=facility,
+                            arrival_deadline_seconds=arrive_by,
+                            pickup_earliest_seconds=pickup_earliest,
+                            pickup_latest_seconds=pickup_latest,
+                        )
+                    )
+
+                routes, totals = solve_daily_auditor_routes(
+                    depot=depot,
+                    auditors=auditors,
                     driver_count=int(driver_count),
-                    return_to_depot=return_to_depot,
-                    require_all_drivers_if_possible=require_all_drivers_if_possible,
-                    default_arrival_deadline_seconds=default_arrival_seconds,
+                    require_all_drivers_if_possible=require_all_drivers,
                 )
+
             st.session_state["routes"] = routes
             st.session_state["totals"] = totals
-        except Exception as exc:  # noqa: BLE001 - display friendly app error
+        except Exception as exc:  # noqa: BLE001
             st.error(str(exc))
 
     if "routes" in st.session_state and "totals" in st.session_state:
