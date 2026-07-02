@@ -1394,11 +1394,7 @@ def main() -> None:
     require_password_if_configured()
     reset_stale_session_state()
 
-    st.title("Multi-Driver Auditor Route Optimizer")
-    st.caption(
-        "Same driver drops off and picks up the same auditor. The route starts at the depot in the morning, "
-        "drops auditors at facilities, picks those same auditors up after work, then returns to the depot at end of day."
-    )
+    st.title("Route Optimizer")
 
     with st.sidebar:
         st.header("Settings")
@@ -1417,13 +1413,13 @@ def main() -> None:
     st.markdown("### Daily setup")
     top_cols = st.columns([1, 1, 1, 1, 2])
     with top_cols[0]:
-        auditor_count = st.number_input("Number of auditors/facilities", min_value=1, max_value=39, value=7, step=1)
+        auditor_count = st.number_input("Number of auditors", min_value=1, max_value=39, value=7, step=1)
     with top_cols[1]:
         driver_count = st.number_input("Number of drivers", min_value=1, max_value=20, value=4, step=1)
     with top_cols[2]:
-        default_arrival_time = st.time_input("Default arrive by", value=datetime.time(8, 30))
+        default_arrive_by = datetime.time(8, 30)
     with top_cols[3]:
-        default_pickup_earliest = st.time_input("Default can leave", value=datetime.time(17, 0))
+        default_can_leave = datetime.time(17, 0)
     with top_cols[4]:
         depot_input = st.text_input(
             "Office",
@@ -1437,8 +1433,7 @@ def main() -> None:
         help="If auditors >= drivers, every driver is forced to handle at least one auditor.",
     )
 
-    st.markdown("### Auditors / facilities")
-    st.caption("Each row is one auditor's facility. The same driver that drops this auditor off will pick them up again.")
+    st.markdown("### Facilities' Locations")
 
     stop_rows: List[Tuple[str, int, int]] = []
     with st.form("daily_route_form"):
