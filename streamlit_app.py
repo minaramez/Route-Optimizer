@@ -1421,12 +1421,12 @@ def main() -> None:
     with top_cols[1]:
         driver_count = st.number_input("Number of drivers", min_value=1, max_value=20, value=4, step=1)
     with top_cols[2]:
-        default_arrival_time = st.time_input("Default arrive by", value=datetime.time(9, 0))
+        default_arrival_time = st.time_input("Default arrive by", value=datetime.time(8, 30))
     with top_cols[3]:
-        default_pickup_earliest = st.time_input("Default can leave", value=datetime.time(16, 0))
+        default_pickup_earliest = st.time_input("Default can leave", value=datetime.time(17, 0))
     with top_cols[4]:
         depot_input = st.text_input(
-            "Depot / office",
+            "Office",
             value=st.session_state.get("depot_input", "24.485451, 54.381805"),
             placeholder="Office address, coordinates, or Google Maps link",
         )
@@ -1446,7 +1446,7 @@ def main() -> None:
         header[0].markdown("**#**")
         header[1].markdown("**Facility Google Maps link / coordinates / address**")
         header[2].markdown("**Arrive by**")
-        header[3].markdown("**Can leave**")
+        header[3].markdown("**Leave by**")
 
         for idx in range(1, int(auditor_count) + 1):
             row = st.columns([0.3, 4.0, 1, 1])
