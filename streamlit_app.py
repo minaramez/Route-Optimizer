@@ -32,7 +32,7 @@ class AuditorStop:
     facility: Location
     arrival_deadline_seconds: int
     pickup_earliest_seconds: int
-    pickup_latest_seconds: int
+    pickup_latest_seconds: Optional[int] = None
 
 
 @dataclass
@@ -94,7 +94,7 @@ APP_USER_AGENT = get_secret_or_env(
 )
 GEOCODE_DELAY_SECONDS = float_setting("GEOCODE_DELAY_SECONDS", 1.05)
 MAX_OSRM_LOCATIONS = int_setting("MAX_OSRM_LOCATIONS", 80)
-APP_STATE_VERSION = "2026-07-02-v4-auditor-round-trip"
+APP_STATE_VERSION = "2026-07-02-v5-no-hard-latest-pickup"
 
 
 def reset_stale_session_state() -> None:
@@ -532,8 +532,10 @@ def solve_daily_auditor_routes(
 
     # Time windows:
     # - drop-off nodes must be reached by each auditor's audit start time
-    # - pickup nodes cannot be before the auditor can leave, and should not be after latest pickup
-    # - soft upper bound at pickup earliest makes the solver reduce "auditor waiting after work"
+    # - pickup nodes cannot be before the auditor can leave
+    # - there is intentionally NO hard latest pickup by default, because hard latest
+    #   pickups can make the whole day infeasible for far facilities.
+    # - soft upper bound at pickup earliest makes the solver reduce "auditor waiting after work".
     pickup_lateness_penalty_per_second = 10_000
     for i, auditor in enumerate(auditors):
         drop_node = drop_node_by_auditor[i]
@@ -542,9 +544,10 @@ def solve_daily_auditor_routes(
         pickup_index = manager.NodeToIndex(pickup_node)
 
         time_dimension.CumulVar(drop_index).SetRange(0, auditor.arrival_deadline_seconds)
+        pickup_latest = auditor.pickup_latest_seconds if auditor.pickup_latest_seconds is not None else horizon_seconds
         time_dimension.CumulVar(pickup_index).SetRange(
             auditor.pickup_earliest_seconds,
-            auditor.pickup_latest_seconds,
+            pickup_latest,
         )
         time_dimension.SetCumulVarSoftUpperBound(
             pickup_index,
@@ -580,8 +583,8 @@ def solve_daily_auditor_routes(
     solution = routing.SolveWithParameters(search_parameters)
     if not solution:
         raise ValueError(
-            "No feasible schedule found. Try increasing the pickup latest time, using more drivers, "
-            "or checking whether the facilities are too far apart for the selected time windows."
+            "No feasible schedule found. Check the morning arrival times, use more drivers, "
+            "or check whether the facilities are too far apart for the selected time windows."
         )
 
     routes: List[DailyDriverRoute] = []
@@ -721,7 +724,11 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
             warnings.append(f"Driver {route.driver_number} would need to start before midnight to meet the morning arrival deadlines.")
         for auditor in route.pickup_order:
             pickup_time = route.pickup_times.get(auditor.label)
-            if pickup_time is not None and pickup_time > auditor.pickup_latest_seconds:
+            if (
+                pickup_time is not None
+                and auditor.pickup_latest_seconds is not None
+                and pickup_time > auditor.pickup_latest_seconds
+            ):
                 warnings.append(f"{auditor.label} is picked up after the allowed latest pickup time.")
     if warnings:
         st.warning(" ".join(warnings))
@@ -774,7 +781,6 @@ def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[in
                         "#": idx,
                         "Auditor/facility": auditor.label,
                         "Can leave from": format_clock(auditor.pickup_earliest_seconds),
-                        "Latest pickup": format_clock(auditor.pickup_latest_seconds),
                         "Planned pickup": format_clock(pickup_time),
                         "Wait after leave time": format_duration(wait_seconds),
                         "Coordinates": f"{auditor.facility.lat:.6f}, {auditor.facility.lng:.6f}",
@@ -803,8 +809,8 @@ def main() -> None:
             st.caption("Using straight-line estimates only.")
         st.divider()
         st.caption("Morning arrival = when the auditor must reach the facility.")
-        st.caption("Pickup earliest = when the auditor can leave work, usually 16:00.")
-        st.caption("Pickup latest = latest acceptable pickup, usually 17:00.")
+        st.caption("Can leave = when the auditor can leave work, usually 16:00 or 17:00.")
+        st.caption("There is no hard latest-pickup constraint now; the optimizer minimizes waiting instead of failing.")
 
     defaults = default_stop_values()
 
@@ -825,35 +831,32 @@ def main() -> None:
             placeholder="Office address, coordinates, or Google Maps link",
         )
 
-    second_cols = st.columns([1, 1, 2])
+    second_cols = st.columns([1, 2])
     with second_cols[0]:
-        default_pickup_latest = st.time_input("Default latest pickup", value=datetime.time(17, 0))
-    with second_cols[1]:
         require_all_drivers = st.checkbox(
             "Use all drivers when possible",
             value=True,
             help="If auditors >= drivers, every driver is forced to handle at least one auditor.",
         )
-    with second_cols[2]:
+    with second_cols[1]:
         st.info(
-            "The optimizer prioritizes reducing pickup delay after work. A driver will only carry multiple auditors "
-            "when the same-driver morning + afternoon plan still fits the time windows."
+            "There is no hard latest-pickup field now. The optimizer will still try to pick auditors up as close "
+            "as possible to their Can leave time, but it will not fail just because one far route needs more time."
         )
 
     st.markdown("### Auditors / facilities")
     st.caption("Each row is one auditor's facility. The same driver that drops this auditor off will pick them up again.")
 
-    stop_rows: List[Tuple[str, int, int, int]] = []
+    stop_rows: List[Tuple[str, int, int]] = []
     with st.form("daily_route_form"):
-        header = st.columns([0.3, 3.4, 1, 1, 1])
+        header = st.columns([0.3, 4.0, 1, 1])
         header[0].markdown("**#**")
         header[1].markdown("**Facility Google Maps link / coordinates / address**")
         header[2].markdown("**Arrive by**")
         header[3].markdown("**Can leave**")
-        header[4].markdown("**Latest pickup**")
 
         for idx in range(1, int(auditor_count) + 1):
-            row = st.columns([0.3, 3.4, 1, 1, 1])
+            row = st.columns([0.3, 4.0, 1, 1])
             row[0].write(idx)
             default_value = defaults[idx - 1] if idx <= len(defaults) else ""
             raw = row[1].text_input(
@@ -875,18 +878,11 @@ def main() -> None:
                 label_visibility="collapsed",
                 key=f"pickup_earliest_{idx}",
             )
-            pickup_latest = row[4].time_input(
-                f"Latest pickup {idx}",
-                value=default_pickup_latest,
-                label_visibility="collapsed",
-                key=f"pickup_latest_{idx}",
-            )
             stop_rows.append(
                 (
                     raw,
                     seconds_from_time(arrival_time),
                     seconds_from_time(pickup_earliest),
-                    seconds_from_time(pickup_latest),
                 )
             )
 
@@ -904,9 +900,7 @@ def main() -> None:
             with st.spinner("Parsing locations, fetching route matrix, and optimizing full-day routes..."):
                 depot = parse_location(depot_input.strip(), 0, label_prefix="Depot")
                 auditors: List[AuditorStop] = []
-                for idx, (raw, arrive_by, pickup_earliest, pickup_latest) in enumerate(cleaned_rows, start=1):
-                    if pickup_latest < pickup_earliest:
-                        raise ValueError(f"Row {idx}: latest pickup cannot be earlier than can-leave time.")
+                for idx, (raw, arrive_by, pickup_earliest) in enumerate(cleaned_rows, start=1):
                     facility = parse_location(raw, idx, label_prefix="Facility")
                     auditors.append(
                         AuditorStop(
@@ -914,7 +908,7 @@ def main() -> None:
                             facility=facility,
                             arrival_deadline_seconds=arrive_by,
                             pickup_earliest_seconds=pickup_earliest,
-                            pickup_latest_seconds=pickup_latest,
+                            pickup_latest_seconds=None,
                         )
                     )
 
