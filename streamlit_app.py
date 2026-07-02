@@ -94,7 +94,7 @@ APP_USER_AGENT = get_secret_or_env(
 )
 GEOCODE_DELAY_SECONDS = float_setting("GEOCODE_DELAY_SECONDS", 1.05)
 MAX_OSRM_LOCATIONS = int_setting("MAX_OSRM_LOCATIONS", 80)
-APP_STATE_VERSION = "2026-07-02-v7-auditor-priority"
+APP_STATE_VERSION = "2026-07-02-v7-morning-and-afternoon-wait"
 
 
 def reset_stale_session_state() -> None:
@@ -638,10 +638,11 @@ def evaluate_group_plan(
     where the driver is physically waiting/repositioning before pickups begin.
 
     Objective inside one driver group:
-      1. minimize the worst post-work auditor wait
-      2. minimize total post-work waiting
+      1. minimize the worst auditor inconvenience, including being dropped too early
+         before the audit and being picked up too late after the audit
+      2. minimize total auditor inconvenience
       3. avoid before-midnight morning starts
-      4. finish/return earlier
+      4. avoid out-and-back zigzag routes
       5. reduce driving only after auditor time is handled
     """
     if not group:
@@ -660,8 +661,12 @@ def evaluate_group_plan(
             pickup_google_url="",
         )
         stats = {
-            "max_wait": 0,
-            "total_wait": 0,
+            "max_afternoon_wait": 0,
+            "total_afternoon_wait": 0,
+            "max_morning_early_wait": 0,
+            "total_morning_early_wait": 0,
+            "max_auditor_wait": 0,
+            "total_auditor_wait": 0,
             "start_deficit": 0,
             "return_depot": 0,
             "drive_time": 0,
@@ -687,6 +692,16 @@ def evaluate_group_plan(
         latest_start = min(a.arrival_deadline_seconds - offsets[a.label] for a in morning_order)
         start_deficit = max(0, -latest_start)
         morning_drop_times = {label: latest_start + offset for label, offset in offsets.items()}
+        # Auditor time matters in the morning too. If someone is dropped at 07:50
+        # for a 09:30 audit, that is 1h40 of auditor waiting and should be
+        # heavily penalized. This prevents routes like Abu Dhabi -> Dubai ->
+        # half-way back to Abu Dhabi just because the driving path looks efficient.
+        morning_early_waits = [
+            max(0, auditor.arrival_deadline_seconds - morning_drop_times[auditor.label])
+            for auditor in morning_order
+        ]
+        max_morning_early_wait = max(morning_early_waits, default=0)
+        total_morning_early_wait = sum(morning_early_waits)
         morning_drive = elapsed
         morning_distance = route_drive_distance(morning_nodes, distance_matrix)
 
@@ -723,8 +738,10 @@ def evaluate_group_plan(
             pickup_distance += distance_matrix[prev_pickup_node][0]
             return_depot_time = current_time + time_matrix[prev_pickup_node][0]
 
-            max_wait = max(waits, default=0)
-            total_wait = sum(waits)
+            max_afternoon_wait = max(waits, default=0)
+            total_afternoon_wait = sum(waits)
+            max_auditor_wait = max(max_morning_early_wait, max_afternoon_wait)
+            total_auditor_wait = total_morning_early_wait + total_afternoon_wait
             total_drive = morning_drive + pickup_drive
             total_distance = morning_distance + pickup_distance
 
@@ -734,12 +751,22 @@ def evaluate_group_plan(
                 for j in nodes_in_group:
                     route_span = max(route_span, time_matrix[i][j])
 
+            # Primary objective is auditor experience, not driver convenience.
+            # 1) worst single auditor wait, whether in the morning or afternoon
+            # 2) total auditor waiting
+            # 3) specifically avoid very-early morning drop-offs
+            # 4) specifically avoid very-late afternoon pickups
+            # 5) avoid impossible / before-midnight starts
+            # 6) avoid grouping facilities that are far apart on the same route
+            # 7) then consider return time and driving time
             objective = (
-                max_wait,
-                total_wait,
+                max_auditor_wait,
+                total_auditor_wait,
+                max_morning_early_wait,
+                max_afternoon_wait,
                 start_deficit,
-                return_depot_time,
                 route_span,
+                return_depot_time,
                 total_drive,
                 total_distance,
             )
@@ -754,8 +781,12 @@ def evaluate_group_plan(
                     return_depot_time,
                     total_drive,
                     total_distance,
-                    max_wait,
-                    total_wait,
+                    max_afternoon_wait,
+                    total_afternoon_wait,
+                    max_morning_early_wait,
+                    total_morning_early_wait,
+                    max_auditor_wait,
+                    total_auditor_wait,
                     start_deficit,
                     route_span,
                 )
@@ -771,8 +802,12 @@ def evaluate_group_plan(
         return_depot,
         total_drive,
         total_distance,
-        max_wait,
-        total_wait,
+        max_afternoon_wait,
+        total_afternoon_wait,
+        max_morning_early_wait,
+        total_morning_early_wait,
+        max_auditor_wait,
+        total_auditor_wait,
         start_deficit,
         route_span,
     ) = best
@@ -796,8 +831,12 @@ def evaluate_group_plan(
         pickup_google_url=build_google_maps_directions_url(pickup_points) if len(pickup_points) >= 2 else "",
     )
     stats = {
-        "max_wait": max_wait,
-        "total_wait": total_wait,
+        "max_afternoon_wait": max_afternoon_wait,
+        "total_afternoon_wait": total_afternoon_wait,
+        "max_morning_early_wait": max_morning_early_wait,
+        "total_morning_early_wait": total_morning_early_wait,
+        "max_auditor_wait": max_auditor_wait,
+        "total_auditor_wait": total_auditor_wait,
         "start_deficit": start_deficit,
         "return_depot": return_depot or 0,
         "drive_time": route.total_driving_seconds,
@@ -828,8 +867,12 @@ def evaluate_assignment(
     required_drivers = min(len(auditors), len(groups)) if require_all_drivers_if_possible else 0
     unused_required = max(0, required_drivers - drivers_used)
 
-    max_wait = max((s["max_wait"] for s in stats_list), default=0)
-    total_wait = sum(s["total_wait"] for s in stats_list)
+    max_auditor_wait = max((s["max_auditor_wait"] for s in stats_list), default=0)
+    total_auditor_wait = sum(s["total_auditor_wait"] for s in stats_list)
+    max_morning_early_wait = max((s["max_morning_early_wait"] for s in stats_list), default=0)
+    total_morning_early_wait = sum(s["total_morning_early_wait"] for s in stats_list)
+    max_afternoon_wait = max((s["max_afternoon_wait"] for s in stats_list), default=0)
+    total_afternoon_wait = sum(s["total_afternoon_wait"] for s in stats_list)
     start_deficit = sum(s["start_deficit"] for s in stats_list)
     latest_return = max((s["return_depot"] for s in stats_list), default=0)
     total_drive = sum(s["drive_time"] for s in stats_list)
@@ -838,16 +881,19 @@ def evaluate_assignment(
 
     # Auditor-first lexicographic objective:
     # 1) use all drivers when requested
-    # 2) minimize the worst auditor wait after Can leave
+    # 2) minimize the worst total auditor wait, including early drop-off and late pickup
     # 3) minimize total auditor waiting
-    # 4) avoid before-midnight / unrealistic morning starts
-    # 5) avoid pairing a close facility with a very far facility unless it truly helps
-    # 6) finish earlier
-    # 7) reduce driver driving only after auditor time is protected
+    # 4) avoid very early morning drop-offs
+    # 5) avoid late afternoon pickups
+    # 6) avoid before-midnight / unrealistic morning starts
+    # 7) avoid pairing far-apart facilities on the same driver
+    # 8) reduce driver driving only after auditor time is protected
     objective = (
         unused_required,
-        max_wait,
-        total_wait,
+        max_auditor_wait,
+        total_auditor_wait,
+        max_morning_early_wait,
+        max_afternoon_wait,
         start_deficit,
         max_route_span,
         latest_return,
@@ -864,8 +910,12 @@ def evaluate_assignment(
         "total_distance": total_distance,
         "latest_common_start": min(latest_common_start_candidates) if latest_common_start_candidates else None,
         "latest_return": latest_return if used_routes else None,
-        "max_pickup_wait": max_wait,
-        "total_pickup_wait": total_wait,
+        "max_auditor_wait": max_auditor_wait,
+        "total_auditor_wait": total_auditor_wait,
+        "max_morning_early_wait": max_morning_early_wait,
+        "total_morning_early_wait": total_morning_early_wait,
+        "max_pickup_wait": max_afternoon_wait,
+        "total_pickup_wait": total_afternoon_wait,
         "morning_start_deficit": start_deficit,
     }
     return objective, routes, totals
@@ -1096,14 +1146,15 @@ def default_stop_values() -> List[str]:
 
 def render_results(routes: List[DailyDriverRoute], totals: Dict[str, Optional[int]]) -> None:
     st.subheader("Summary")
-    cols = st.columns(7)
+    cols = st.columns(8)
     cols[0].metric("Auditors", totals.get("auditors") or 0)
     cols[1].metric("Drivers used", f"{totals.get('drivers_used') or 0}/{totals.get('driver_count') or 0}")
     cols[2].metric("Latest common morning start", format_clock(totals.get("latest_common_start")))
     cols[3].metric("Latest depot return", format_clock(totals.get("latest_return")))
-    cols[4].metric("Max pickup wait", format_duration(int(totals.get("max_pickup_wait") or 0)))
-    cols[5].metric("Total driving", format_duration(int(totals.get("total_driving_time") or 0)))
-    cols[6].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
+    cols[4].metric("Max auditor wait", format_duration(int(totals.get("max_auditor_wait") or 0)))
+    cols[5].metric("Max early drop-off", format_duration(int(totals.get("max_morning_early_wait") or 0)))
+    cols[6].metric("Total driving", format_duration(int(totals.get("total_driving_time") or 0)))
+    cols[7].metric("Total distance", format_distance(int(totals.get("total_distance") or 0)))
 
     warnings = []
     for route in routes:
