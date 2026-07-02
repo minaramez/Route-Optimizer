@@ -1395,19 +1395,7 @@ def main() -> None:
     reset_stale_session_state()
 
     st.title("Route Optimizer")
-
-    with st.sidebar:
-        st.header("Settings")
-        st.write(f"Routing provider: **{ROUTING_PROVIDER}**")
-        if ROUTING_PROVIDER == "osrm":
-            st.caption("Using OSRM/OpenStreetMap road travel times. No live traffic and no paid Google API key.")
-        else:
-            st.caption("Using straight-line estimates only.")
-        st.divider()
-        st.caption("Morning arrival = when the auditor must reach the facility.")
-        st.caption("Can leave = when the auditor can leave work, usually 16:00 or 17:00.")
-        st.caption("Auditor-priority mode: use all drivers, keep auditor waiting low, then cluster nearby facilities before reducing driver driving.")
-
+        
     defaults = default_stop_values()
 
     # st.markdown("### Daily setup")
