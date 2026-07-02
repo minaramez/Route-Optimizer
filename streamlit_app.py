@@ -48,8 +48,8 @@ def render_google_maps_logo_button(url: str) -> None:
                 display:inline-flex;
                 align-items:center;
                 justify-content:center;
-                width:{GOOGLE_LOGO_BUTTON_SIZE + 18}px;
-                height:{GOOGLE_LOGO_BUTTON_SIZE + 18}px;
+                width:{GOOGLE_LOGO_BUTTON_SIZE + 25}px;
+                height:{GOOGLE_LOGO_BUTTON_SIZE + 12.5}px;
                 padding:8px;
                 border:1px solid rgba(49, 51, 63, 0.22);
                 border-radius:16px;
