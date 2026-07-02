@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import itertools
 import hmac
 import math
 import os
@@ -11,7 +12,6 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 import streamlit as st
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 
 # -----------------------------------------------------------------------------
@@ -94,7 +94,7 @@ APP_USER_AGENT = get_secret_or_env(
 )
 GEOCODE_DELAY_SECONDS = float_setting("GEOCODE_DELAY_SECONDS", 1.05)
 MAX_OSRM_LOCATIONS = int_setting("MAX_OSRM_LOCATIONS", 80)
-APP_STATE_VERSION = "2026-07-02-v5-no-hard-latest-pickup"
+APP_STATE_VERSION = "2026-07-02-v6-heuristic-full-day"
 
 
 def reset_stale_session_state() -> None:
@@ -478,6 +478,375 @@ def build_google_maps_directions_url(points: List[Location]) -> str:
 # Optimization
 # -----------------------------------------------------------------------------
 
+def route_drive_time(order: List[int], time_matrix: List[List[int]]) -> int:
+    if len(order) < 2:
+        return 0
+    return sum(time_matrix[order[i]][order[i + 1]] for i in range(len(order) - 1))
+
+
+def route_drive_distance(order: List[int], distance_matrix: List[List[int]]) -> int:
+    if len(order) < 2:
+        return 0
+    return sum(distance_matrix[order[i]][order[i + 1]] for i in range(len(order) - 1))
+
+
+def auditor_node(auditors: List[AuditorStop], auditor: AuditorStop) -> int:
+    # In the physical matrix, node 0 is depot and auditors are 1..N in input order.
+    return auditors.index(auditor) + 1
+
+
+def candidate_orders(items: List[AuditorStop], max_exact: int = 8) -> List[Tuple[AuditorStop, ...]]:
+    """Return route-order candidates.
+
+    For normal use, a driver's group is small, so exact permutations are fine.
+    For very large groups, use a few sensible greedy orders to avoid freezing Streamlit.
+    """
+    if len(items) <= max_exact:
+        return list(itertools.permutations(items))
+
+    by_arrival = tuple(sorted(items, key=lambda a: (a.arrival_deadline_seconds, a.label)))
+    by_leave = tuple(sorted(items, key=lambda a: (a.pickup_earliest_seconds, a.label)))
+    by_distance_from_depot = tuple(items)
+    return [by_arrival, by_leave, by_distance_from_depot]
+
+
+def best_morning_sequence(
+    depot: Location,
+    all_auditors: List[AuditorStop],
+    group: List[AuditorStop],
+    time_matrix: List[List[int]],
+    distance_matrix: List[List[int]],
+) -> Tuple[List[AuditorStop], Dict[str, int], Optional[int], int, int, int]:
+    """Choose the morning drop-off order for one driver.
+
+    We do not hard-fail if an arrival time is impossible from the depot. Instead we
+    return a negative latest_start and show the user that this driver would need to
+    leave before midnight / before the workday. This is much more helpful than
+    "no feasible schedule".
+    """
+    if not group:
+        return [], {}, None, 0, 0, 0
+
+    best = None
+    for order in candidate_orders(group):
+        elapsed = 0
+        prev_node = 0
+        offsets: Dict[str, int] = {}
+        for auditor in order:
+            node = auditor_node(all_auditors, auditor)
+            elapsed += time_matrix[prev_node][node]
+            offsets[auditor.label] = elapsed
+            prev_node = node
+
+        latest_start = min(a.arrival_deadline_seconds - offsets[a.label] for a in order)
+        start_deficit = max(0, -latest_start)
+        drive_time = elapsed
+        drive_distance = route_drive_distance(
+            [0] + [auditor_node(all_auditors, a) for a in order], distance_matrix
+        )
+        # Prefer schedules that do not need a before-midnight start, then latest possible start,
+        # then shorter driving.
+        objective = (start_deficit, -latest_start, drive_time, drive_distance)
+        if best is None or objective < best[0]:
+            best = (objective, list(order), offsets, latest_start, drive_time, drive_distance)
+
+    assert best is not None
+    _, order, offsets, latest_start, drive_time, drive_distance = best
+    drop_times = {label: latest_start + offset for label, offset in offsets.items()}
+    return order, drop_times, latest_start, drive_time, drive_distance, max(0, -latest_start)
+
+
+def best_pickup_sequence(
+    depot: Location,
+    all_auditors: List[AuditorStop],
+    group: List[AuditorStop],
+    morning_order: List[AuditorStop],
+    morning_drop_times: Dict[str, int],
+    time_matrix: List[List[int]],
+    distance_matrix: List[List[int]],
+) -> Tuple[List[AuditorStop], Dict[str, int], Optional[int], int, int, int, int]:
+    """Choose the afternoon pickup order for one driver.
+
+    The driver does NOT return to depot after morning drop-off. The afternoon route
+    starts from the driver's last morning drop-off facility, waits/repositions if
+    needed, picks up the same auditors, then returns to depot.
+    """
+    if not group:
+        return [], {}, None, 0, 0, 0, 0
+
+    if morning_order:
+        start_node = auditor_node(all_auditors, morning_order[-1])
+        start_time = morning_drop_times.get(morning_order[-1].label, 0)
+    else:
+        start_node = 0
+        start_time = 0
+
+    best = None
+    for order in candidate_orders(group):
+        current_time = start_time
+        prev_node = start_node
+        pickup_times: Dict[str, int] = {}
+        drive_time = 0
+        drive_distance = 0
+        waits: List[int] = []
+
+        for auditor in order:
+            node = auditor_node(all_auditors, auditor)
+            travel = time_matrix[prev_node][node]
+            distance = distance_matrix[prev_node][node]
+            arrival_at_facility = current_time + travel
+            pickup_time = max(auditor.pickup_earliest_seconds, arrival_at_facility)
+            wait_after_can_leave = max(0, pickup_time - auditor.pickup_earliest_seconds)
+
+            pickup_times[auditor.label] = pickup_time
+            waits.append(wait_after_can_leave)
+            drive_time += travel
+            drive_distance += distance
+            current_time = pickup_time
+            prev_node = node
+
+        drive_time += time_matrix[prev_node][0]
+        drive_distance += distance_matrix[prev_node][0]
+        return_depot_time = current_time + time_matrix[prev_node][0]
+
+        max_wait = max(waits, default=0)
+        total_wait = sum(waits)
+        # Main priority: do not make one auditor wait forever. Then reduce total waiting,
+        # then finish earlier, then reduce driving.
+        objective = (max_wait, total_wait, return_depot_time, drive_time, drive_distance)
+        if best is None or objective < best[0]:
+            best = (objective, list(order), pickup_times, return_depot_time, drive_time, drive_distance, max_wait, total_wait)
+
+    assert best is not None
+    _, order, pickup_times, return_depot_time, drive_time, drive_distance, max_wait, total_wait = best
+    return order, pickup_times, return_depot_time, drive_time, drive_distance, max_wait, total_wait
+
+
+def evaluate_group_plan(
+    depot: Location,
+    all_auditors: List[AuditorStop],
+    group: List[AuditorStop],
+    driver_number: int,
+    time_matrix: List[List[int]],
+    distance_matrix: List[List[int]],
+) -> Tuple[DailyDriverRoute, Dict[str, int]]:
+    morning_order, morning_drop_times, latest_start, morning_drive, morning_distance, start_deficit = best_morning_sequence(
+        depot, all_auditors, group, time_matrix, distance_matrix
+    )
+    pickup_order, pickup_times, return_depot, pickup_drive, pickup_distance, max_wait, total_wait = best_pickup_sequence(
+        depot, all_auditors, group, morning_order, morning_drop_times, time_matrix, distance_matrix
+    )
+
+    morning_points = [depot] + [auditor.facility for auditor in morning_order]
+    # Include the driver's last morning location as the origin for the afternoon route so the
+    # route reflects that drivers do not return to depot until the day is done.
+    if morning_order and pickup_order:
+        afternoon_start = morning_order[-1].facility
+        pickup_points = [afternoon_start] + [auditor.facility for auditor in pickup_order] + [depot]
+    else:
+        pickup_points = [auditor.facility for auditor in pickup_order] + [depot]
+
+    route = DailyDriverRoute(
+        driver_number=driver_number,
+        auditors=list(group),
+        morning_order=morning_order,
+        pickup_order=pickup_order,
+        morning_drop_times=morning_drop_times,
+        pickup_times=pickup_times,
+        latest_morning_start_seconds=latest_start,
+        return_depot_seconds=return_depot,
+        total_driving_seconds=morning_drive + pickup_drive,
+        total_distance_meters=morning_distance + pickup_distance,
+        morning_google_url=build_google_maps_directions_url(morning_points) if len(morning_points) >= 2 else "",
+        pickup_google_url=build_google_maps_directions_url(pickup_points) if len(pickup_points) >= 2 else "",
+    )
+    stats = {
+        "max_wait": max_wait,
+        "total_wait": total_wait,
+        "start_deficit": start_deficit,
+        "return_depot": return_depot or 0,
+        "drive_time": route.total_driving_seconds,
+        "distance": route.total_distance_meters,
+    }
+    return route, stats
+
+
+def evaluate_assignment(
+    depot: Location,
+    auditors: List[AuditorStop],
+    groups: List[List[AuditorStop]],
+    time_matrix: List[List[int]],
+    distance_matrix: List[List[int]],
+    require_all_drivers_if_possible: bool,
+) -> Tuple[Tuple[int, int, int, int, int, int, int], List[DailyDriverRoute], Dict[str, Optional[int]]]:
+    routes: List[DailyDriverRoute] = []
+    stats_list: List[Dict[str, int]] = []
+    for i, group in enumerate(groups):
+        route, stats = evaluate_group_plan(depot, auditors, group, i + 1, time_matrix, distance_matrix)
+        routes.append(route)
+        if group:
+            stats_list.append(stats)
+
+    used_routes = [route for route in routes if route.auditors]
+    drivers_used = len(used_routes)
+    required_drivers = min(len(auditors), len(groups)) if require_all_drivers_if_possible else 0
+    unused_required = max(0, required_drivers - drivers_used)
+
+    max_wait = max((s["max_wait"] for s in stats_list), default=0)
+    total_wait = sum(s["total_wait"] for s in stats_list)
+    start_deficit = sum(s["start_deficit"] for s in stats_list)
+    latest_return = max((s["return_depot"] for s in stats_list), default=0)
+    total_drive = sum(s["drive_time"] for s in stats_list)
+    total_distance = sum(s["distance"] for s in stats_list)
+
+    # Lexicographic objective:
+    # 1) use all drivers when requested
+    # 2) avoid impossible/too-early morning starts
+    # 3) minimize the worst auditor wait after can-leave time
+    # 4) minimize total waiting
+    # 5) finish earlier
+    # 6) reduce total driving
+    objective = (
+        unused_required,
+        start_deficit,
+        max_wait,
+        total_wait,
+        latest_return,
+        total_drive,
+        total_distance,
+    )
+
+    latest_common_start_candidates = [r.latest_morning_start_seconds for r in used_routes if r.latest_morning_start_seconds is not None]
+    totals: Dict[str, Optional[int]] = {
+        "auditors": len(auditors),
+        "drivers_used": drivers_used,
+        "driver_count": len(groups),
+        "total_driving_time": total_drive,
+        "total_distance": total_distance,
+        "latest_common_start": min(latest_common_start_candidates) if latest_common_start_candidates else None,
+        "latest_return": latest_return if used_routes else None,
+        "max_pickup_wait": max_wait,
+        "total_pickup_wait": total_wait,
+        "morning_start_deficit": start_deficit,
+    }
+    return objective, routes, totals
+
+
+def seed_initial_groups(
+    auditors: List[AuditorStop],
+    driver_count: int,
+    time_matrix: List[List[int]],
+    require_all_drivers_if_possible: bool,
+) -> List[List[AuditorStop]]:
+    groups: List[List[AuditorStop]] = [[] for _ in range(driver_count)]
+    if not auditors:
+        return groups
+
+    # Start by spreading the farthest / most time-constrained auditors across drivers.
+    ranked = sorted(
+        auditors,
+        key=lambda a: (
+            -(time_matrix[0][auditor_node(auditors, a)] + time_matrix[auditor_node(auditors, a)][0]),
+            a.arrival_deadline_seconds,
+        ),
+    )
+
+    next_driver = 0
+    if require_all_drivers_if_possible:
+        for auditor in ranked[: min(driver_count, len(ranked))]:
+            groups[next_driver].append(auditor)
+            next_driver += 1
+        remaining = ranked[min(driver_count, len(ranked)):]
+    else:
+        remaining = ranked
+
+    for auditor in remaining:
+        # Lightweight placement: put the auditor into the group that currently has the smallest
+        # depot round-trip burden. Full local search improves this immediately after.
+        best_driver = min(
+            range(driver_count),
+            key=lambda d: sum(time_matrix[0][auditor_node(auditors, a)] + time_matrix[auditor_node(auditors, a)][0] for a in groups[d]),
+        )
+        groups[best_driver].append(auditor)
+
+    return groups
+
+
+def improve_assignment(
+    depot: Location,
+    auditors: List[AuditorStop],
+    groups: List[List[AuditorStop]],
+    time_matrix: List[List[int]],
+    distance_matrix: List[List[int]],
+    require_all_drivers_if_possible: bool,
+) -> Tuple[List[List[AuditorStop]], Tuple[int, int, int, int, int, int, int], List[DailyDriverRoute], Dict[str, Optional[int]]]:
+    best_objective, best_routes, best_totals = evaluate_assignment(
+        depot, auditors, groups, time_matrix, distance_matrix, require_all_drivers_if_possible
+    )
+
+    required_drivers = min(len(auditors), len(groups)) if require_all_drivers_if_possible else 0
+
+    improved = True
+    passes = 0
+    while improved and passes < 20:
+        improved = False
+        passes += 1
+
+        # Try moving one auditor to another driver.
+        for src in range(len(groups)):
+            for auditor in list(groups[src]):
+                if len(groups[src]) <= 1 and sum(1 for g in groups if g) <= required_drivers:
+                    continue
+                for dst in range(len(groups)):
+                    if src == dst:
+                        continue
+                    candidate = [list(g) for g in groups]
+                    candidate[src].remove(auditor)
+                    candidate[dst].append(auditor)
+                    objective, routes, totals = evaluate_assignment(
+                        depot, auditors, candidate, time_matrix, distance_matrix, require_all_drivers_if_possible
+                    )
+                    if objective < best_objective:
+                        groups = candidate
+                        best_objective, best_routes, best_totals = objective, routes, totals
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+
+        if improved:
+            continue
+
+        # Try swapping auditors between drivers.
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                for auditor_a in list(groups[a]):
+                    for auditor_b in list(groups[b]):
+                        candidate = [list(g) for g in groups]
+                        candidate[a].remove(auditor_a)
+                        candidate[b].remove(auditor_b)
+                        candidate[a].append(auditor_b)
+                        candidate[b].append(auditor_a)
+                        objective, routes, totals = evaluate_assignment(
+                            depot, auditors, candidate, time_matrix, distance_matrix, require_all_drivers_if_possible
+                        )
+                        if objective < best_objective:
+                            groups = candidate
+                            best_objective, best_routes, best_totals = objective, routes, totals
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+
+    return groups, best_objective, best_routes, best_totals
+
+
 def solve_daily_auditor_routes(
     depot: Location,
     auditors: List[AuditorStop],
@@ -485,208 +854,30 @@ def solve_daily_auditor_routes(
     require_all_drivers_if_possible: bool = True,
     solver_seconds: int = 30,
 ) -> Tuple[List[DailyDriverRoute], Dict[str, Optional[int]]]:
+    """Build practical full-day routes for the auditor use case.
+
+    This deliberately avoids the previous hard OR-Tools time-window model because that model
+    can return "no feasible schedule" even when a usable business schedule exists. Here,
+    morning arrival times are handled as "leave as late as possible" calculations, and the
+    afternoon is optimized around minimizing how long auditors wait after they can leave.
+    """
+    del solver_seconds  # kept for backward compatibility with old calls
+
     if driver_count < 1:
         raise ValueError("Driver count must be at least 1.")
     if not auditors:
         raise ValueError("Add at least one auditor/facility.")
 
-    # Build one OSRM matrix for unique physical points only, then duplicate each facility
-    # into a morning drop-off node and an afternoon pickup node.
     physical_locations = [depot] + [auditor.facility for auditor in auditors]
-    base_time_matrix, base_distance_matrix = compute_route_matrix(physical_locations)
-    time_matrix, distance_matrix, _ = expand_facility_matrix_for_drop_pickup(
-        base_time_matrix, base_distance_matrix, len(auditors)
+    time_matrix, distance_matrix = compute_route_matrix(physical_locations)
+
+    groups = seed_initial_groups(auditors, driver_count, time_matrix, require_all_drivers_if_possible)
+    groups, _, routes, totals = improve_assignment(
+        depot, auditors, groups, time_matrix, distance_matrix, require_all_drivers_if_possible
     )
 
-    n = len(auditors)
-    total_nodes = 1 + 2 * n
-    depot_node = 0
-    drop_node_by_auditor = {i: 1 + i for i in range(n)}
-    pickup_node_by_auditor = {i: 1 + n + i for i in range(n)}
-    auditor_index_by_node = {1 + i: i for i in range(n)}
-    auditor_index_by_node.update({1 + n + i: i for i in range(n)})
-
-    manager = pywrapcp.RoutingIndexManager(total_nodes, driver_count, depot_node)
-    routing = pywrapcp.RoutingModel(manager)
-
-    def time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return int(time_matrix[from_node][to_node])
-
-    transit_callback_index = routing.RegisterTransitCallback(time_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-    # Enough slack for the driver to wait between morning drop-offs and afternoon pickups.
-    horizon_seconds = 24 * 3600
-    routing.AddDimension(
-        transit_callback_index,
-        horizon_seconds,   # allow waiting
-        horizon_seconds,   # daily horizon
-        False,             # flexible start time; we compute/display latest feasible morning start
-        "Time",
-    )
-    time_dimension = routing.GetDimensionOrDie("Time")
-
-    solver = routing.solver()
-
-    # Time windows:
-    # - drop-off nodes must be reached by each auditor's audit start time
-    # - pickup nodes cannot be before the auditor can leave
-    # - there is intentionally NO hard latest pickup by default, because hard latest
-    #   pickups can make the whole day infeasible for far facilities.
-    # - soft upper bound at pickup earliest makes the solver reduce "auditor waiting after work".
-    pickup_lateness_penalty_per_second = 10_000
-    for i, auditor in enumerate(auditors):
-        drop_node = drop_node_by_auditor[i]
-        pickup_node = pickup_node_by_auditor[i]
-        drop_index = manager.NodeToIndex(drop_node)
-        pickup_index = manager.NodeToIndex(pickup_node)
-
-        time_dimension.CumulVar(drop_index).SetRange(0, auditor.arrival_deadline_seconds)
-        pickup_latest = auditor.pickup_latest_seconds if auditor.pickup_latest_seconds is not None else horizon_seconds
-        time_dimension.CumulVar(pickup_index).SetRange(
-            auditor.pickup_earliest_seconds,
-            pickup_latest,
-        )
-        time_dimension.SetCumulVarSoftUpperBound(
-            pickup_index,
-            auditor.pickup_earliest_seconds,
-            pickup_lateness_penalty_per_second,
-        )
-
-        # Same driver must drop off and pick up the same auditor.
-        solver.Add(routing.VehicleVar(drop_index) == routing.VehicleVar(pickup_index))
-        # Pickup must happen after drop-off.
-        solver.Add(time_dimension.CumulVar(drop_index) <= time_dimension.CumulVar(pickup_index))
-
-    for vehicle_id in range(driver_count):
-        time_dimension.CumulVar(routing.Start(vehicle_id)).SetRange(0, 12 * 3600)
-        time_dimension.CumulVar(routing.End(vehicle_id)).SetRange(0, horizon_seconds)
-
-    # Encourage actual use of all drivers where it makes sense. This matters because otherwise
-    # the solver can leave one driver unused and make auditors wait for one long shared route.
-    if require_all_drivers_if_possible:
-        vehicles_to_force = min(driver_count, n)
-        for vehicle_id in range(vehicles_to_force):
-            solver.Add(routing.NextVar(routing.Start(vehicle_id)) != routing.End(vehicle_id))
-
-    # Tie-breakers: keep the day compact and reduce unnecessary driving after satisfying the
-    # pickup-waiting objective.
-    time_dimension.SetGlobalSpanCostCoefficient(10)
-
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.seconds = solver_seconds
-
-    solution = routing.SolveWithParameters(search_parameters)
-    if not solution:
-        raise ValueError(
-            "No feasible schedule found. Check the morning arrival times, use more drivers, "
-            "or check whether the facilities are too far apart for the selected time windows."
-        )
-
-    routes: List[DailyDriverRoute] = []
-    for vehicle_id in range(driver_count):
-        index = routing.Start(vehicle_id)
-        route_nodes: List[int] = []
-        route_seconds = 0
-        route_meters = 0
-        previous_node: Optional[int] = None
-
-        while not routing.IsEnd(index):
-            node = manager.IndexToNode(index)
-            if previous_node is not None:
-                route_seconds += time_matrix[previous_node][node]
-                route_meters += distance_matrix[previous_node][node]
-            if node != depot_node:
-                route_nodes.append(node)
-            previous_node = node
-            index = solution.Value(routing.NextVar(index))
-
-        end_node = manager.IndexToNode(index)
-        end_time = solution.Value(time_dimension.CumulVar(index))
-        if previous_node is not None:
-            route_seconds += time_matrix[previous_node][end_node]
-            route_meters += distance_matrix[previous_node][end_node]
-
-        morning_nodes = [node for node in route_nodes if 1 <= node <= n]
-        pickup_nodes = [node for node in route_nodes if n + 1 <= node <= 2 * n]
-        morning_order = [auditors[auditor_index_by_node[node]] for node in morning_nodes]
-        pickup_order = [auditors[auditor_index_by_node[node]] for node in pickup_nodes]
-        assigned_indices = sorted({auditor_index_by_node[node] for node in route_nodes})
-        assigned_auditors = [auditors[i] for i in assigned_indices]
-
-        # Compute latest possible morning start from depot while still meeting every drop-off deadline.
-        latest_start: Optional[int] = None
-        morning_drop_times: Dict[str, int] = {}
-        if morning_nodes:
-            offsets: List[Tuple[int, int]] = []
-            elapsed = 0
-            prev = depot_node
-            for node in morning_nodes:
-                elapsed += time_matrix[prev][node]
-                offsets.append((node, elapsed))
-                prev = node
-            latest_start = min(
-                auditors[auditor_index_by_node[node]].arrival_deadline_seconds - offset
-                for node, offset in offsets
-            )
-            for node, offset in offsets:
-                auditor = auditors[auditor_index_by_node[node]]
-                morning_drop_times[auditor.label] = latest_start + offset
-
-        pickup_times: Dict[str, int] = {}
-        for node in pickup_nodes:
-            auditor = auditors[auditor_index_by_node[node]]
-            node_index = manager.NodeToIndex(node)
-            pickup_times[auditor.label] = solution.Value(time_dimension.CumulVar(node_index))
-
-        morning_points = [depot] + [auditor.facility for auditor in morning_order]
-        pickup_points = [auditor.facility for auditor in pickup_order] + [depot]
-        morning_url = build_google_maps_directions_url(morning_points) if len(morning_points) >= 2 else ""
-        pickup_url = build_google_maps_directions_url(pickup_points) if len(pickup_points) >= 2 else ""
-
-        routes.append(
-            DailyDriverRoute(
-                driver_number=vehicle_id + 1,
-                auditors=assigned_auditors,
-                morning_order=morning_order,
-                pickup_order=pickup_order,
-                morning_drop_times=morning_drop_times,
-                pickup_times=pickup_times,
-                latest_morning_start_seconds=latest_start,
-                return_depot_seconds=end_time if assigned_auditors else None,
-                total_driving_seconds=route_seconds if assigned_auditors else 0,
-                total_distance_meters=route_meters if assigned_auditors else 0,
-                morning_google_url=morning_url,
-                pickup_google_url=pickup_url,
-            )
-        )
-
-    used_routes = [route for route in routes if route.auditors]
-    pickup_waits = []
-    for route in used_routes:
-        for auditor in route.pickup_order:
-            pickup_time = route.pickup_times.get(auditor.label)
-            if pickup_time is not None:
-                pickup_waits.append(max(0, pickup_time - auditor.pickup_earliest_seconds))
-
-    latest_common_start_candidates = [
-        route.latest_morning_start_seconds for route in used_routes if route.latest_morning_start_seconds is not None
-    ]
-    totals: Dict[str, Optional[int]] = {
-        "auditors": len(auditors),
-        "drivers_used": len(used_routes),
-        "driver_count": driver_count,
-        "total_driving_time": sum(route.total_driving_seconds for route in used_routes),
-        "total_distance": sum(route.total_distance_meters for route in used_routes),
-        "latest_common_start": min(latest_common_start_candidates) if latest_common_start_candidates else None,
-        "latest_return": max((route.return_depot_seconds for route in used_routes if route.return_depot_seconds is not None), default=None),
-        "max_pickup_wait": max(pickup_waits, default=0),
-        "total_pickup_wait": sum(pickup_waits),
-    }
+    # Keep routes ordered by driver number and make sure empty drivers remain visible.
+    routes = sorted(routes, key=lambda r: r.driver_number)
     return routes, totals
 
 
@@ -810,7 +1001,7 @@ def main() -> None:
         st.divider()
         st.caption("Morning arrival = when the auditor must reach the facility.")
         st.caption("Can leave = when the auditor can leave work, usually 16:00 or 17:00.")
-        st.caption("There is no hard latest-pickup constraint now; the optimizer minimizes waiting instead of failing.")
+        st.caption("No hard latest-pickup constraint. The scheduler uses all drivers when requested and minimizes auditor waiting after work.")
 
     defaults = default_stop_values()
 
