@@ -20,11 +20,15 @@ import streamlit as st
 # Frontend settings
 # -----------------------------------------------------------------------------
 
-GOOGLE_LOGO_BUTTON_SIZE = 65  # Change this number to resize the Google Maps logo button.
+# Google Maps route logo button sizing.
+# Increase/decrease these numbers to resize the rectangular button.
+GOOGLE_LOGO_BUTTON_WIDTH = 210
+GOOGLE_LOGO_BUTTON_HEIGHT = 82
+GOOGLE_LOGO_IMAGE_WIDTH = 165
 
 
 def render_google_maps_logo_button(url: str) -> None:
-    """Render an icon-only Google Maps route button."""
+    """Render a centered, rectangular Google Maps logo route button."""
     logo_path = os.path.join(os.path.dirname(__file__), "google.png")
     safe_url = html.escape(url, quote=True)
 
@@ -34,31 +38,34 @@ def render_google_maps_logo_button(url: str) -> None:
         logo_html = (
             f'<img src="data:image/png;base64,{encoded_logo}" '
             f'alt="Open route in Google Maps" '
-            f'style="width:{GOOGLE_LOGO_BUTTON_SIZE}px; height:{GOOGLE_LOGO_BUTTON_SIZE}px; object-fit:contain; display:block;" />'
+            f'style="width:{GOOGLE_LOGO_IMAGE_WIDTH}px; height:auto; max-height:{GOOGLE_LOGO_BUTTON_HEIGHT - 22}px; object-fit:contain; display:block;" />'
         )
     else:
         logo_html = (
-            f'<span style="font-size:{GOOGLE_LOGO_BUTTON_SIZE - 8}px; line-height:{GOOGLE_LOGO_BUTTON_SIZE}px;">🗺️</span>'
+            '<span style="font-size:18px; font-weight:600; color:#1f1f1f; white-space:nowrap;">🗺️ Google Maps</span>'
         )
 
     st.markdown(
         f"""
-        <a href="{safe_url}" target="_blank" rel="noopener noreferrer" title="Open route in Google Maps"
-           style="
-                display:inline-flex;
-                align-items:center;
-                justify-content:center;
-                width:{GOOGLE_LOGO_BUTTON_SIZE + 25}px;
-                height:{GOOGLE_LOGO_BUTTON_SIZE + 12.5}px;
-                padding:8px;
-                border:1px solid rgba(49, 51, 63, 0.22);
-                border-radius:16px;
-                background:#ffffff;
-                box-shadow:0 2px 8px rgba(0, 0, 0, 0.08);
-                text-decoration:none;
-           ">
-            {logo_html}
-        </a>
+        <div style="display:flex; justify-content:center; width:100%; margin:0.65rem 0 1.15rem 0;">
+            <a href="{safe_url}" target="_blank" rel="noopener noreferrer" title="Open route in Google Maps"
+               style="
+                    display:inline-flex;
+                    align-items:center;
+                    justify-content:center;
+                    width:{GOOGLE_LOGO_BUTTON_WIDTH}px;
+                    height:{GOOGLE_LOGO_BUTTON_HEIGHT}px;
+                    padding:10px 18px;
+                    border:1px solid rgba(60, 64, 67, 0.28);
+                    border-radius:16px;
+                    background:#ffffff;
+                    box-shadow:0 2px 8px rgba(60, 64, 67, 0.16);
+                    text-decoration:none;
+                    box-sizing:border-box;
+               ">
+                {logo_html}
+            </a>
+        </div>
         """,
         unsafe_allow_html=True,
     )
